@@ -1,9 +1,12 @@
-# docker compose run --rm dev pytest
-# docker compose run --rm dev ruff check .
-# docker compose run --rm dev mypy
+# Tooling only — not a deployment. Production runs on Windows next to the MT5 terminal.
+# docker compose run --rm test pytest
+# docker compose run --rm test ruff check .
+# docker compose run --rm test mypy
 services:
-  dev:
-    build: .
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
     volumes:
       - .:/app:ro  # read-only: the container never writes into the repo
     environment:

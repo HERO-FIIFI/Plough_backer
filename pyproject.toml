@@ -35,6 +35,12 @@ plough-backer = "plough_backer.main:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/plough_backer"]
 
+# Ship the operational files the app needs so an installed wheel isn't tied to the repo root.
+[tool.hatch.build.targets.wheel.force-include]
+"config" = "plough_backer/resources/config"
+"migrations" = "plough_backer/resources/migrations"
+"alembic.ini" = "plough_backer/resources/alembic.ini"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]  # lets tests import shared helpers from tests/conftest.py

@@ -1,0 +1,26 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]" build
+      - run: ruff check .
+      - run: mypy
+      - run: pytest  # unit + SQLite integration; mt5_demo skipped without --run-mt5-demo
+      - name: Alembic upgrade from empty DB + single head
+        env:
+          DATABASE_URL: sqlite:///ci.db
+        run: |
+          alembic upgrade head
+          test "$(alembic heads | wc -l)" -eq 1
+      - name: Wheel builds and installs outside the repo
+        run: |
+          python -m build --wheel
+          python -m venv /tmp/w && /tmp/w/bin/pip install dist/*.whl
+          cd /tmp && /tmp/w/bin/python -c "import plough_backer"

@@ -1,6 +1,6 @@
-# Dev/test image. Repo is bind-mounted read-only at /app; nothing is baked in but deps.
+# TOOLING ONLY — dev/test image, NOT a deployable runtime (no source, no CMD; MT5 is Windows-only).
+# Repo is bind-mounted read-only at /app; nothing is baked in but deps.
 # Python 3.12 = the README's minimum supported version.
-# NOTE: MetaTrader5 is Windows-only — MT5 demo tests (Phase 12) cannot run in this image.
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
