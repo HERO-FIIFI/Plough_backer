@@ -1,0 +1,28 @@
+# Symbol aliases (README §11). mt5_symbol is your broker's exact name — check it in
+# MT5 Market Watch. Contract specs are NEVER configured here; they come from MT5 (§13).
+symbols:
+  GOLD:
+    aliases:
+      - GOLD
+      - XAUUSD
+    mt5_symbol: XAUUSDm
+    asset_class: GOLD
+
+  # Broker synthetics (e.g. Deriv). Min lots differ per symbol (0.0005, 0.001, 0.5, …)
+  # and are read from MT5 — never set them here. Uncomment and match your broker's names:
+  # BOOM1000:
+  #   aliases:
+  #     - BOOM 1000
+  #     - BOOM1000
+  #   mt5_symbol: Boom 1000 Index
+  #   asset_class: SYNTHETIC
+  # V75:
+  #   aliases:
+  #     - V75
+  #     - VOLATILITY 75
+  #   mt5_symbol: Volatility 75 Index
+  #   asset_class: SYNTHETIC
+
+gold:
+  take_profit_policy: TP2
+  missing_tp2_policy: REJECT

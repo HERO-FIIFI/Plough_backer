@@ -1,0 +1,3 @@
+# Only pyproject.toml is needed at build time; keep secrets and data out of the image.
+*
+!pyproject.toml

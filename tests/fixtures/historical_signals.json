@@ -1,0 +1,19 @@
+{
+  "_note": "Synthetic replay fixture (not real channel history). Gold: $1 per 0.01 move per lot.",
+  "starting_balance": "100",
+  "volume_max_policy": "REJECT",
+  "leverage": "1000",
+  "symbols": {
+    "XAUUSD": {"volume_min": "0.01", "volume_max": "100", "volume_step": "0.01",
+               "tick_size": "0.01", "tick_value": "1", "contract_size": "100"}
+  },
+  "signals": [
+    {"symbol": "XAUUSD", "direction": "BUY",  "entry": "4500", "sl": "4492", "tp": "4512", "outcome": "WIN"},
+    {"symbol": "XAUUSD", "direction": "SELL", "entry": "4520", "sl": "4528", "tp": "4508", "outcome": "WIN"},
+    {"symbol": "XAUUSD", "direction": "BUY",  "entry": "4510", "sl": "4502", "tp": "4522", "outcome": "LOSS"},
+    {"symbol": "XAUUSD", "direction": "BUY",  "entry": "4505", "sl": "4497", "tp": "4517", "outcome": "WIN"},
+    {"symbol": "XAUUSD", "direction": "SELL", "entry": "4530", "sl": "4538", "tp": "4518", "outcome": "LOSS"},
+    {"symbol": "XAUUSD", "direction": "BUY",  "entry": "4500", "sl": "4492", "tp": "4512", "outcome": "BREAKEVEN"},
+    {"symbol": "XAUUSD", "direction": "BUY",  "entry": "4500", "sl": "4492", "tp": "4512", "outcome": "WIN"}
+  ]
+}

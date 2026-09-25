@@ -1,0 +1,112 @@
+# README §62: every fixture has an explicit expected result.
+# `expect` is either a parsed signal or `rejected: {kind: parse|invalid, reason: ...}`.
+# These are the README §9 formats only. Add real channel messages here, per profile.
+
+symbols:
+  symbols:
+    GOLD:
+      aliases: [GOLD, XAUUSD]
+      mt5_symbol: XAUUSDm
+      asset_class: GOLD
+    BOOM1000:
+      aliases: [BOOM 1000, BOOM1000]
+      mt5_symbol: Boom 1000 Index
+      asset_class: SYNTHETIC
+      take_profit_policy: TP1   # test-only choice; real policy awaits Q-04
+    V75:
+      aliases: [V75, VOLATILITY 75]
+      mt5_symbol: Volatility 75 Index
+      asset_class: SYNTHETIC    # no take_profit_policy -> rejected (Q-04)
+  gold:
+    take_profit_policy: TP2
+    missing_tp2_policy: REJECT
+
+cases:
+  - name: readme_format_1_gold_buy
+    message: "BUY GOLD 4500\nSL 4492\nTP1 4506\nTP2 4512\nTP3 4518"
+    expect: {symbol: XAUUSDm, direction: BUY, order_type: MARKET, entry: "4500", sl: "4492",
+             tps: ["4506", "4512", "4518"], selected: "4512"}
+
+  - name: readme_format_2_colons_and_at
+    message: "XAUUSD BUY @ 4500\n\nSL: 4492\nTP1: 4506\nTP2: 4512"
+    expect: {symbol: XAUUSDm, direction: BUY, order_type: MARKET, entry: "4500", sl: "4492",
+             tps: ["4506", "4512"], selected: "4512"}
+
+  - name: gold_sell_lowercase
+    message: "sell gold 4500.50\nsl 4508.5\ntp1 4494\ntp2 4488\ntp3 4480"
+    expect: {symbol: XAUUSDm, direction: SELL, order_type: MARKET, entry: "4500.50",
+             sl: "4508.5", tps: ["4494", "4488", "4480"], selected: "4488"}
+
+  - name: gold_market_now_no_entry
+    message: "GOLD BUY NOW\nSL 4492\nTP1 4506\nTP2 4512"
+    expect: {symbol: XAUUSDm, direction: BUY, order_type: MARKET, entry: null, sl: "4492",
+             tps: ["4506", "4512"], selected: "4512"}
+
+  - name: gold_pending_buy_limit
+    message: "BUY LIMIT GOLD 4495\nSL 4488\nTP1 4502\nTP2 4510"
+    expect: {symbol: XAUUSDm, direction: BUY, order_type: BUY_LIMIT, entry: "4495", sl: "4488",
+             tps: ["4502", "4510"], selected: "4510"}
+
+  - name: commentary_lines_ignored
+    message: "🔥 VIP SIGNAL 🔥\nXAUUSD SELL 4500\nSL 4508\nTP1 4494\nTP2 4488\nUse proper lot size"
+    expect: {symbol: XAUUSDm, direction: SELL, order_type: MARKET, entry: "4500", sl: "4508",
+             tps: ["4494", "4488"], selected: "4488"}
+
+  - name: synthetic_multiword_alias_with_digits
+    message: "BOOM 1000 BUY 12345.67\nSL 12300\nTP1 12400\nTP2 12450"
+    expect: {symbol: Boom 1000 Index, direction: BUY, order_type: MARKET, entry: "12345.67",
+             sl: "12300", tps: ["12400", "12450"], selected: "12400"}
+
+  - name: synthetic_sell_stop
+    message: "SELL STOP BOOM1000 12300\nSL 12350\nTP1 12200"
+    expect: {symbol: Boom 1000 Index, direction: SELL, order_type: SELL_STOP, entry: "12300",
+             sl: "12350", tps: ["12200"], selected: "12200"}
+
+  # --- fail-closed cases ---
+  - name: readme_missing_sl
+    message: "GOLD BUY NOW\nTP 4510"
+    expect: {rejected: {kind: invalid, reason: STOP_LOSS_MISSING}}
+
+  - name: gold_missing_tp2
+    message: "BUY GOLD 4500\nSL 4492\nTP1 4506"
+    expect: {rejected: {kind: invalid, reason: TP2_MISSING}}
+
+  - name: gold_unlabelled_tp_is_not_tp2
+    message: "BUY GOLD 4500\nSL 4492\nTP 4512"
+    expect: {rejected: {kind: invalid, reason: TP2_MISSING}}
+
+  - name: malformed_sl_number
+    message: "BUY GOLD 4500\nSL 449O\nTP1 4506\nTP2 4512"
+    expect: {rejected: {kind: parse, reason: MALFORMED_NUMBER}}
+
+  - name: malformed_thousands_separator
+    message: "BUY GOLD 4,500\nSL 4492\nTP1 4506\nTP2 4512"
+    expect: {rejected: {kind: parse, reason: MALFORMED_NUMBER}}
+
+  - name: unsupported_symbol
+    message: "BUY EURUSD 1.1000\nSL 1.0950\nTP1 1.1050\nTP2 1.1100"
+    expect: {rejected: {kind: invalid, reason: UNSUPPORTED_SYMBOL}}
+
+  - name: synthetic_without_tp_policy
+    message: "V75 BUY 350000\nSL 349000\nTP1 351000"
+    expect: {rejected: {kind: invalid, reason: TP_POLICY_NOT_CONFIGURED}}
+
+  - name: entry_range_rejected
+    message: "BUY GOLD 4500-4495\nSL 4488\nTP1 4506\nTP2 4512"
+    expect: {rejected: {kind: parse, reason: AMBIGUOUS_ENTRY}}
+
+  - name: two_directions_rejected
+    message: "BUY GOLD 4500\nSL 4492\nTP2 4512\nSELL GOLD 4520\nSL 4528\nTP2 4508"
+    expect: {rejected: {kind: parse, reason: AMBIGUOUS_SIGNAL}}
+
+  - name: two_stop_losses_rejected
+    message: "BUY GOLD 4500\nSL 4492\nSL 4490\nTP1 4506\nTP2 4512"
+    expect: {rejected: {kind: parse, reason: AMBIGUOUS_SIGNAL}}
+
+  - name: pending_without_price
+    message: "BUY LIMIT GOLD\nSL 4488\nTP2 4510"
+    expect: {rejected: {kind: invalid, reason: ENTRY_MISSING}}
+
+  - name: no_instruction
+    message: "Market looks bullish today, stay tuned"
+    expect: {rejected: {kind: parse, reason: UNRECOGNIZED_FORMAT}}

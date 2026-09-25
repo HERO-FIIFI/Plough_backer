@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "plough-backer"
+version = "1.0.0.dev0"  # spec label: 1.0.0-demo (README header); PEP 440 form here
+description = "Deterministic Telegram -> MetaTrader 5 signal execution and lot-progression engine"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "SQLAlchemy>=2.0.36",
+    "alembic>=1.14",
+    "PyYAML>=6.0.2",
+    "tzdata>=2024.2",  # Windows has no system IANA tz database; zoneinfo needs this
+    "Telethon>=1.40",  # §5: channel listener (user account; bots can't read other channels)
+    "python-telegram-bot>=22.0",  # §5: admin bot
+]
+# ponytail: APScheduler is added in Phase 10 when reports are scheduled.
+
+[project.optional-dependencies]
+mt5 = ["MetaTrader5>=5.0.5; sys_platform == 'win32'"]  # Windows only, next to the terminal
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "types-PyYAML>=6.0",
+]
+
+[project.scripts]
+plough-backer = "plough_backer.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/plough_backer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]  # lets tests import shared helpers from tests/conftest.py
+addopts = "-ra --strict-markers"
+markers = [
+    "mt5_demo: requires a real MT5 demo terminal; run with --run-mt5-demo",
+]
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = ["migrations/versions"]  # Alembic-generated; reviewed, not hand-styled
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "DTZ", "RUF", "PT", "SIM"]
+ignore = ["S101"]  # assert is how pytest works
+allowed-confusables = ["×", "÷", "–"]  # README display text (mode labels) uses these
+
+[tool.ruff.lint.isort]
+known-first-party = ["plough_backer", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106"]  # fake secrets in tests are intentional
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["plough_backer"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["telethon", "telethon.*"]  # ships no type information
+ignore_missing_imports = true

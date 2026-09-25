@@ -1,0 +1,14 @@
+# docker compose run --rm dev pytest
+# docker compose run --rm dev ruff check .
+# docker compose run --rm dev mypy
+services:
+  dev:
+    build: .
+    volumes:
+      - .:/app:ro  # read-only: the container never writes into the repo
+    environment:
+      PYTHONPATH: /app/src:/app
+      PYTEST_ADDOPTS: "-p no:cacheprovider"
+      MYPY_CACHE_DIR: /tmp/mypy_cache
+      RUFF_CACHE_DIR: /tmp/ruff_cache
+      DATABASE_URL: sqlite:////tmp/plough_backer.db

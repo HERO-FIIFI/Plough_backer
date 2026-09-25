@@ -1,0 +1,35 @@
+# Secrets — never commit (README §53, §54)
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+
+# Runtime data
+data/*
+!data/.gitkeep
+logs/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
