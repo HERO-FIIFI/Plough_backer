@@ -1,7 +1,8 @@
 """Deterministic parser (README §9, §10). Regex only; anything uncertain is rejected.
 
 Profiles are named per source (config/sources.yaml `parser_profile`). `standard_v1` covers
-exactly the README §9 formats; each real channel gets its own profile from its messages.
+exactly the README §9 formats; each real channel gets its own profile module in
+signals/profiles/ that rewrites its text into standard_v1 (see that package's docstring).
 
 standard_v1 rules:
 - exactly one line contains BUY or SELL (optionally + LIMIT/STOP) — the header;
@@ -13,15 +14,19 @@ standard_v1 rules:
 - other lines (commentary) are ignored.
 """
 
+import importlib
+import pkgutil
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from typing import Any
 
 from plough_backer.config import SymbolsConfig
 from plough_backer.enums import Direction, OrderType, RejectionReason
 from plough_backer.exceptions import InvalidSignal, ParseRejected
+from plough_backer.signals import profiles
 from plough_backer.signals.models import NormalizedSignal
 from plough_backer.signals.symbol_resolver import SymbolResolver
 from plough_backer.signals.validators import select_take_profit
@@ -137,8 +142,33 @@ def parse_standard_v1(
 
 
 Parser = Callable[..., ParsedMessage]
-PROFILES: dict[str, Parser] = {"standard_v1": parse_standard_v1}
 PARSER_VERSIONS = {"standard_v1": "standard_v1.0"}
+
+
+def _rewrite_profile(rewrites: list[tuple[str, str]], version: str) -> Parser:
+    rules = [(re.compile(p, re.MULTILINE | re.IGNORECASE), r) for p, r in rewrites]
+
+    def parse(raw: str, **kwargs: Any) -> ParsedMessage:
+        text = raw
+        for pattern, replacement in rules:
+            text = pattern.sub(replacement, text)
+        parsed = parse_standard_v1(text, **kwargs)
+        # journal the provider's original text, stamped with the profile's version
+        signal = replace(parsed.signal, raw_message=raw, parser_version=version)
+        return ParsedMessage(signal, parsed.labelled_take_profits)
+
+    return parse
+
+
+def _load_profiles() -> dict[str, Parser]:
+    found: dict[str, Parser] = {"standard_v1": parse_standard_v1}
+    for info in pkgutil.iter_modules(profiles.__path__):
+        module = importlib.import_module(f"{profiles.__name__}.{info.name}")
+        found[info.name] = _rewrite_profile(module.REWRITES, module.VERSION)
+    return found
+
+
+PROFILES = _load_profiles()
 
 
 def get_parser(profile: str) -> Parser:

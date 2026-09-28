@@ -69,6 +69,67 @@ def test_parsing_is_deterministic() -> None:
     assert parse(msg).signal == parse(msg).signal
 
 
+# --- Provider profiles (signals/profiles/) ------------------------------------------------
+
+LOVEROCK_BUY = """XAUUSD BUY NOW ( 4300 ) ✔️
+
+📊TARGET 1  ( 4306 )✔️
+📊TARGET 2  ( 4312 )✔️
+📊TARGET 3  ( 4320 )✔️
+
+🚫 STOP LOSS   ( 4290 )
+
+RISK MANAGEMENT IS IMPORTANT✔️"""
+
+LOVEROCK_SELL = """📊XAUUSD SELL NOW
+( 4202 ) ✅
+📊TARGET 1  ( 4198 )✅
+📊TARGET 2  ( 4194 )✅
+📊TARGET 3  ( 4190 )✅
+📊TARGET 4  ( 4180 )✅
+
+🚫 STOP LOSS   (  4214  )
+
+RISK MANAGEMENT IS IMPORTANT ✅"""
+
+
+def parse_loverock(message: str) -> Any:
+    return get_parser("loverock_fx")(
+        message,
+        symbols=SYMBOLS,
+        signal_id="PB-000001",
+        source_id="loverock",
+        source_message_id=1,
+        source_timestamp=TS,
+    )
+
+
+@pytest.mark.parametrize(
+    ("message", "direction", "entry", "sl", "tps"),
+    [
+        (LOVEROCK_BUY, "BUY", "4300", "4290", ["4306", "4312", "4320"]),
+        (LOVEROCK_SELL, "SELL", "4202", "4214", ["4198", "4194", "4190", "4180"]),
+    ],
+)
+def test_loverock_profile(
+    message: str, direction: str, entry: str, sl: str, tps: list[str]
+) -> None:
+    s = parse_loverock(message).signal
+    assert s.direction == direction
+    assert s.order_type == "MARKET"
+    assert s.entry == Decimal(entry)
+    assert s.stop_loss == Decimal(sl)
+    assert list(s.take_profits) == [Decimal(t) for t in tps]
+    assert s.raw_message == message  # journal keeps the provider's original text
+    assert s.parser_version == "loverock_fx.1"
+
+
+@pytest.mark.parametrize("message", ["Tp1 hit", "Sl hit", "All tp hit"])
+def test_loverock_follow_ups_are_not_signals(message: str) -> None:
+    with pytest.raises(ParseRejected):
+        parse_loverock(message)
+
+
 def test_unknown_profile_fails_closed() -> None:
     with pytest.raises(ParseRejected):
         get_parser("nope")

@@ -1,7 +1,7 @@
 # Telegram signal sources (README §3, §23). Chat ids are not secrets but are account-specific.
 sources: []
-#  - id: gold_signals
-#    name: Gold Signals
+#  - id: loverock_fx
+#    name: LOVEROCK FX
 #    telegram_chat_id: -1001234567890
-#    parser_profile: gold_signals_v1
+#    parser_profile: loverock_fx   # = module name in src/plough_backer/signals/profiles/
 #    enabled: true
