@@ -2779,6 +2779,8 @@ or an appropriate Windows service wrapper.
 
 Configure automatic restart after failure.
 
+Implemented by `scripts/run_forever.ps1 -Install` (logon task + restart loop; logs to `data/plough_backer.log`).
+
 ---
 
 # 74. Startup Command
