@@ -87,6 +87,7 @@ class Settler:
         still_open = self._gateway.open_position_ids()
         settled = []
         for trade_id, position_id in candidates:
+            assert position_id is not None  # filtered by the query above
             if position_id in still_open:
                 continue
             deals = self._gateway.deals_for_position(position_id)

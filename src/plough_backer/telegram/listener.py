@@ -22,6 +22,22 @@ def chat_map(sources: SourcesConfig) -> dict[int, str]:
     return {s.telegram_chat_id: s.id for s in sources.sources if s.enabled}
 
 
+async def warm_entities(client: TelegramClient, sources: SourcesConfig) -> list[int]:
+    """Cache every joined chat; return configured chat ids the account can't see.
+
+    A fresh session knows no access hashes, so channel updates and catch-up
+    (iter_messages) for those chats fail or never arrive, without an error.
+    """
+    await client.get_dialogs()
+    missing = []
+    for chat_id in chat_map(sources):
+        try:
+            await client.get_entity(chat_id)
+        except ValueError:  # Telethon: entity not found (account hasn't joined)
+            missing.append(chat_id)
+    return missing
+
+
 def build_listener(
     *,
     api_id: int,

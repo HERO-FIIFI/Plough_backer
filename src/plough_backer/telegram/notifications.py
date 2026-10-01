@@ -7,6 +7,29 @@ from plough_backer.trading.settlement import Settlement
 
 __all__ = ["lot", "mode_label", "money"]
 
+TELEGRAM_MAX_CHARS = 4096
+
+
+def split_message(text: str, limit: int = TELEGRAM_MAX_CHARS) -> list[str]:
+    """Split on line breaks to fit Telegram's message cap; hard-cut lines that are too long."""
+    parts: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        while len(line) > limit:
+            if current:
+                parts.append(current)
+                current = ""
+            parts.append(line[:limit])
+            line = line[limit:]
+        if len(current) + len(line) > limit:
+            parts.append(current)
+            current = ""
+        current += line
+    if current or not parts:
+        parts.append(current)
+    return parts
+
+
 _REASON_TEXT = {
     "STOP_LOSS_MISSING": "Stop loss could not be determined.",
     "TP2_MISSING": "TP2 missing (Gold policy: TP2, missing TP2 → reject).",

@@ -7,7 +7,7 @@ missed-message catch-up (§58) and health status (§56).
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -143,7 +143,7 @@ class Runtime:
 
     @staticmethod
     def _report_done(s: Session, key: str) -> bool:
-        events = s.scalars(
+        events: Sequence[dict[str, Any]] = s.scalars(
             select(AuditEvent.payload).where(
                 AuditEvent.event_type == AuditEventType.REPORT_GENERATED
             )
@@ -242,7 +242,7 @@ async def run(settings: Settings, sessions: sessionmaker[Session]) -> None:  # p
     from plough_backer.telegram import notifications
     from plough_backer.telegram.bot import build_application
     from plough_backer.telegram.handlers import AdminCommands
-    from plough_backer.telegram.listener import build_listener
+    from plough_backer.telegram.listener import build_listener, warm_entities
     from plough_backer.trading.executor import ExecutionPolicy
     from plough_backer.trading.mt5_client import MT5Client, load_mt5
     from plough_backer.trading.settlement import SettlementPolicy
@@ -308,7 +308,8 @@ async def run(settings: Settings, sessions: sessionmaker[Session]) -> None:  # p
 
     async def notify(message: str) -> None:
         try:
-            await bot.bot.send_message(chat_id=admin_id, text=message)
+            for part in notifications.split_message(message):
+                await bot.bot.send_message(chat_id=admin_id, text=part)
         except Exception:
             log.exception("notify_failed")  # never let Telegram break trading
 
@@ -346,8 +347,12 @@ async def run(settings: Settings, sessions: sessionmaker[Session]) -> None:  # p
     await bot.initialize()
     await bot.start()
     assert bot.updater is not None
-    await bot.updater.start_polling()
+    await bot.updater.start_polling(drop_pending_updates=True)  # stale presses must not apply
     await listener.start()  # Telethon: built-in reconnect with retries
+    missing = await warm_entities(listener, sources)
+    if missing:
+        log.error("telegram_chats_not_joined", extra={"chat_ids": missing})
+        await notify(f"⚠️ Listener account can't see source chats: {missing}. Join them.")
     with sessions.begin() as s:
         repo.append_audit(s, AuditEventType.TELEGRAM_CONNECTED)
     await runtime.recover()

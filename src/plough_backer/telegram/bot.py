@@ -5,10 +5,17 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import (
+    AIORateLimiter,
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 
 from plough_backer.enums import TradingStatus
 from plough_backer.telegram.handlers import AdminCommands, Reply
+from plough_backer.telegram.notifications import TELEGRAM_MAX_CHARS, split_message
 
 
 def _markup(reply: Reply) -> InlineKeyboardMarkup | None:
@@ -23,7 +30,8 @@ def _markup(reply: Reply) -> InlineKeyboardMarkup | None:
 
 
 def build_application(token: str, commands: AdminCommands) -> Application:  # type: ignore[type-arg]
-    app = Application.builder().token(token).build()
+    # Rate limiter queues sends and retries on RetryAfter instead of dropping alerts.
+    app = Application.builder().token(token).rate_limiter(AIORateLimiter()).build()
 
     def command(
         fn: Callable[[int | None, list[str]], Reply],
@@ -34,7 +42,10 @@ def build_application(token: str, commands: AdminCommands) -> Application:  # ty
             user = update.effective_user.id if update.effective_user else None
             # DB/MT5 calls are blocking: keep them off the event loop.
             reply = await asyncio.to_thread(fn, user, list(context.args or []))
-            await update.effective_message.reply_text(reply.text, reply_markup=_markup(reply))
+            *head, last = split_message(reply.text)
+            for part in head:
+                await update.effective_message.reply_text(part)
+            await update.effective_message.reply_text(last, reply_markup=_markup(reply))
 
         return handler
 
@@ -45,7 +56,8 @@ def build_application(token: str, commands: AdminCommands) -> Application:  # ty
         await query.answer()
         user = query.from_user.id if query.from_user else None
         reply = await asyncio.to_thread(commands.callback, user, query.data)
-        await query.edit_message_text(reply.text, reply_markup=_markup(reply))
+        # An edit can't split; truncate (dashboard/menus are far below the cap).
+        await query.edit_message_text(reply.text[:TELEGRAM_MAX_CHARS], reply_markup=_markup(reply))
 
     routes: dict[str, Callable[[int | None, list[str]], Reply]] = {
         "start": lambda u, a: commands.dashboard(u),

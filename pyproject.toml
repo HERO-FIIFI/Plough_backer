@@ -16,7 +16,7 @@ dependencies = [
     "PyYAML>=6.0.2",
     "tzdata>=2024.2",  # Windows has no system IANA tz database; zoneinfo needs this
     "Telethon>=1.40",  # §5: channel listener (user account; bots can't read other channels)
-    "python-telegram-bot>=22.0",  # §5: admin bot
+    "python-telegram-bot[rate-limiter]>=22.0",  # §5: admin bot; extra = AIORateLimiter
 ]
 # ponytail: APScheduler is added in Phase 10 when reports are scheduled.
 

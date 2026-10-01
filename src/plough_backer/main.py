@@ -8,6 +8,8 @@ Exits non-zero before touching Telegram/MT5 if any open trading decision is unse
 import asyncio
 import logging
 import sys
+import time
+from collections.abc import Callable
 
 from sqlalchemy import Engine
 
@@ -24,6 +26,34 @@ from plough_backer.persistence.database import (
 log = logging.getLogger(__name__)
 
 EXIT_CONFIG_ERROR = 2
+RESTART_MIN_DELAY_S = 5
+RESTART_MAX_DELAY_S = 300
+HEALTHY_RUN_S = 600  # a run this long resets the backoff
+
+
+def serve(
+    run_once: Callable[[], None],
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> None:
+    """Restart the runtime forever with exponential backoff; only Ctrl+C stops it.
+
+    Safe because every run repeats the §30 restart sequence (recovery, reconciliation,
+    catch-up). A process crash still needs an OS supervisor (NSSM / Task Scheduler).
+    """
+    delay = RESTART_MIN_DELAY_S
+    while True:
+        started = clock()
+        try:
+            run_once()
+            log.warning("runtime_stopped")  # Telegram disconnected for good
+        except Exception:
+            log.exception("runtime_crashed")
+        if clock() - started >= HEALTHY_RUN_S:
+            delay = RESTART_MIN_DELAY_S
+        log.info("runtime_restarting", extra={"delay_s": delay})
+        sleep(delay)
+        delay = min(delay * 2, RESTART_MAX_DELAY_S)
 
 
 def bootstrap(settings: Settings) -> Engine:
@@ -60,8 +90,11 @@ def main() -> int:
         engine.dispose()
         print(f"startup refused: set {', '.join(missing)} in .env", file=sys.stderr)
         return EXIT_CONFIG_ERROR
+    sessions = session_factory(engine)
+    # Telethon receive callbacks don't fire on Windows' default Proactor loop.
+    loop_factory = asyncio.SelectorEventLoop if sys.platform == "win32" else None
     try:
-        asyncio.run(runtime.run(settings, session_factory(engine)))
+        serve(lambda: asyncio.run(runtime.run(settings, sessions), loop_factory=loop_factory))
     except KeyboardInterrupt:
         log.info("shutdown_requested")
     finally:

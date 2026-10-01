@@ -112,7 +112,7 @@ DEMO_READY ≠ live authorization.
 - Q-12: STOP and PAUSE both block new orders, and both can be resumed from Telegram. Neither closes positions.
 - Q-13: an edit of a non-executed message is stored only, never re-parsed. An edit after execution triggers the §25 alert only.
 - Q-16: `AdminCommands` accepts a set of admin ids. Config still has a single `TELEGRAM_ADMIN_USER_ID`.
-- Not wired yet: `main` does not start the listener or bot yet (Phase 11 restart sequence). §58 catch-up is not implemented. The Telegram libraries were only constructed offline, never connected.
+- Wired in `runtime.run()`: bot polls with `drop_pending_updates=True` and `AIORateLimiter`; the listener warms its entity cache (`get_dialogs`) and alerts about source chats it can't see; §58 catch-up runs after recovery. Windows uses the selector event loop for Telethon. Never connected to real Telegram yet (Phase 12).
 
 **Provisional choices in Phases 8–10:**
 - Q-03: `SettlementPolicy(breakeven_tolerance, manual_close_is_other)` is required. Net P/L includes swap, commission and fee. BREAKEVEN and OTHER end in `CLOSED_OTHER`.

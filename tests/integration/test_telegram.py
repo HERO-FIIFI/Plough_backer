@@ -301,3 +301,44 @@ def test_listener_builds_for_enabled_sources(
     assert chat_map(SOURCES) == {-100: "gold"}
     assert len(client.list_event_handlers()) == 2
     assert not client.is_connected()
+
+
+def test_split_message_fits_telegram_cap() -> None:
+    assert n.split_message("short") == ["short"]
+    assert n.split_message("") == [""]
+    text = "\n".join(f"line {i}" for i in range(2000))  # ~17k chars
+    parts = n.split_message(text)
+    assert all(len(p) <= n.TELEGRAM_MAX_CHARS for p in parts)
+    assert "".join(parts) == text  # nothing lost, splits on line breaks
+    long_line = "x" * 10_000
+    assert [len(p) for p in n.split_message(long_line)] == [4096, 4096, 1808]
+
+
+def test_warm_entities_reports_unjoined_chats() -> None:
+    import asyncio
+
+    from plough_backer.config import SourcesConfig
+    from plough_backer.telegram.listener import warm_entities
+
+    src = {"name": "x", "parser_profile": "standard_v1"}
+    sources = SourcesConfig.model_validate(
+        {
+            "sources": [
+                {**src, "id": "joined", "telegram_chat_id": -100},
+                {**src, "id": "not_joined", "telegram_chat_id": -200},
+            ]
+        }
+    )
+
+    class FakeClient:
+        dialogs_loaded = False
+
+        async def get_dialogs(self) -> None:
+            self.dialogs_loaded = True
+
+        async def get_entity(self, chat_id: int) -> object:
+            if not self.dialogs_loaded or chat_id != -100:
+                raise ValueError("Could not find the input entity")
+            return object()
+
+    assert asyncio.run(warm_entities(FakeClient(), sources)) == [-200]  # type: ignore[arg-type]
