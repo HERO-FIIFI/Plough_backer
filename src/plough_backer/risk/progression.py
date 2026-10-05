@@ -2,7 +2,8 @@
 
 `settle` is called only for a SETTLED executed trade (INV-02). Blocked, rejected, paused
 and skipped signals never reach it (INV-03/04/05). Broker volume normalization happens
-elsewhere and never writes back here (INV-06).
+elsewhere and never writes back here (INV-06); the explicit broker-limit safety reset is
+a separate progression lifecycle event.
 
 Each state carries its own `base_lot`, so the rules are the same whether a scope's base is a
 symbol's volume_min or a unit multiplier (SPEC_NOTES Q-01 is decided by the caller).
@@ -118,3 +119,12 @@ def settle(state: ProgressionState, outcome: TradeOutcome) -> ProgressionState:
         wins=state.wins + won,
         losses=state.losses + (not won),
     )
+
+
+def reset_at_broker_limit(
+    state: ProgressionState, *, volume_min: Decimal, volume_max: Decimal
+) -> tuple[ProgressionState, bool]:
+    """Reset before an at/above-max progression lot can be traded."""
+    if state.theoretical_lot < volume_max:
+        return state, False
+    return ProgressionState.initial(state.mode, volume_min), True

@@ -789,7 +789,16 @@ volume < volume_min
 
 and never submit a broker-invalid lot increment.
 
-If theoretical volume exceeds `volume_max`, the broker constraint must be handled explicitly and logged.
+Before sizing a progression trade, compare its theoretical lot with the current symbol
+specification. If `theoretical_lot >= volume_max`, start a fresh progression cycle at the
+current `volume_min` before the trade is sized. This applies to every broker-specific maximum
+(for example 25, 50 or 100 lots), resets the progression counters, and MUST emit a
+`PROGRESSION_RESET` audit event with the old lot and broker limits.
+
+This safety reset is a progression lifecycle event, not normalization feedback. Ordinary lot
+rounding still never modifies theoretical progression. Non-progression normalization callers
+must continue to handle an above-maximum request explicitly according to their configured
+CAP/REJECT policy.
 
 Do not silently pretend the requested volume was executed.
 
@@ -1589,6 +1598,7 @@ TRADE_EXECUTED
 TRADE_REJECTED
 TRADE_SETTLED
 MODE_CHANGED
+PROGRESSION_RESET
 EQUITY_LOCK_CHANGED
 PAUSED
 RESUMED
@@ -2695,7 +2705,8 @@ A Telegram message can never create more than one real MT5 execution unless expl
 
 ### INV-02
 
-A progression changes only because of a SETTLED executed trade.
+A WIN/LOSS rule changes progression only because of a SETTLED executed trade. The
+broker-limit safety reset is the sole sizing-time exception and is always audited.
 
 ### INV-03
 

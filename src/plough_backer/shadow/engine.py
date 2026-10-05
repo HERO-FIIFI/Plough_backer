@@ -17,7 +17,7 @@ from decimal import Decimal
 from plough_backer.enums import Direction, RiskMode, ShadowStatus, TradeOutcome, VolumeMaxPolicy
 from plough_backer.exceptions import BrokerError
 from plough_backer.risk.normalization import normalize_volume
-from plough_backer.risk.progression import ProgressionState, settle
+from plough_backer.risk.progression import ProgressionState, reset_at_broker_limit, settle
 from plough_backer.trading.gateway import SymbolSpecification
 
 # (symbol, direction, volume, price_open, price_close) -> P/L, e.g. BrokerGateway.calc_profit
@@ -80,6 +80,12 @@ def apply_signal(
     if sig.outcome not in (TradeOutcome.WIN, TradeOutcome.LOSS):
         return
     state = p.states.get(sig.symbol) or ProgressionState.initial(p.mode, sig.spec.volume_min)
+    state, progression_reset = reset_at_broker_limit(
+        state, volume_min=sig.spec.volume_min, volume_max=sig.spec.volume_max
+    )
+    if progression_reset:
+        # Live sizing persists this safety reset before any later execution gate.
+        p.states[sig.symbol] = state
     n = p.trades + 1
     try:
         lot = normalize_volume(

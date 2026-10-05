@@ -1,8 +1,8 @@
 """Execution orchestrator (README §7, §28, Phase 6).
 
-Normalized signal -> progression -> volume normalization -> risk -> Equity Lock -> MT5
--> persistence. Nothing here changes progression: that happens only at settlement
-(Phase 8, INV-02), so every early exit leaves it untouched (INV-03/04/05).
+Normalized signal -> progression -> broker-limit safety reset -> volume normalization ->
+risk -> Equity Lock -> MT5 -> persistence. Outcomes change progression only at settlement;
+the safety reset is persisted before an at/above-max lot can be traded.
 
 Crash safety (§27, INV-15), three transactions:
   1. ingest + parse + dedupe + size + claim (journal row with unique fingerprint) — COMMIT
@@ -51,7 +51,7 @@ from plough_backer.persistence.models import Signal, Trade
 from plough_backer.risk.engine import RiskAssessment, assess_risk
 from plough_backer.risk.equity_lock import EquityLockDecision, check_equity_lock
 from plough_backer.risk.normalization import normalize_volume
-from plough_backer.risk.progression import ProgressionState
+from plough_backer.risk.progression import ProgressionState, reset_at_broker_limit
 from plough_backer.signals.fingerprint import fingerprint
 from plough_backer.signals.models import NormalizedSignal
 from plough_backer.signals.parser import get_parser
@@ -322,11 +322,37 @@ class Orchestrator:
         if loaded is None or loaded[0].mode is not mode:
             state = ProgressionState.initial(mode, spec.volume_min)  # §14 base = volume_min
             if loaded is None:
-                repo.create_progression(s, key, state)
+                version = repo.create_progression(s, key, state)
             else:  # mode changed since this scope last traded (§33)
-                repo.save_progression(s, key, state, expected_version=loaded[1])
+                version = repo.save_progression(s, key, state, expected_version=loaded[1])
         else:
-            state = loaded[0]
+            state, version = loaded
+
+        previous_state = state
+        state, progression_reset = reset_at_broker_limit(
+            state, volume_min=spec.volume_min, volume_max=spec.volume_max
+        )
+        if progression_reset:
+            version = repo.save_progression(s, key, state, expected_version=version)
+            repo.append_audit(
+                s,
+                AuditEventType.PROGRESSION_RESET,
+                scope_key=key,
+                symbol=ns.symbol_mt5,
+                old_theoretical_lot=previous_state.theoretical_lot,
+                new_theoretical_lot=state.theoretical_lot,
+                broker_volume_max=spec.volume_max,
+            )
+            log.warning(
+                "progression_reset_at_broker_limit",
+                extra={
+                    "scope_key": key,
+                    "symbol": ns.symbol_mt5,
+                    "old_theoretical_lot": previous_state.theoretical_lot,
+                    "new_theoretical_lot": state.theoretical_lot,
+                    "broker_volume_max": spec.volume_max,
+                },
+            )
         out.theoretical_lot = state.theoretical_lot
 
         volume = normalize_volume(

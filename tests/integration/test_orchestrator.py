@@ -102,7 +102,7 @@ def test_valid_gold_signal_executes_at_tp2(engine: Engine, gw: FakeGateway) -> N
     assert t.estimated_risk == D("8.00")  # (4500-4492)/0.01 * $1 * 0.01 lot
     assert t.mt5_position_id == out.result.order_id
     assert t.equity_before == D(800)
-    # INV-02: executing does not move progression — only settlement does.
+    # INV-02: ordinary execution does not move progression — only settlement does.
     assert progression(engine) == (ProgressionState.initial(RiskMode.ANTI_MARTINGALE, D("0.01")), 1)
 
 
@@ -215,27 +215,44 @@ def test_broker_rejection_is_recorded_not_retried(engine: Engine, gw: FakeGatewa
     assert progression(engine) == (ProgressionState.initial(RiskMode.ANTI_MARTINGALE, D("0.01")), 1)
 
 
-def test_volume_above_max_with_reject_policy(engine: Engine, gw: FakeGateway) -> None:
+@pytest.mark.parametrize("policy", [VolumeMaxPolicy.REJECT, VolumeMaxPolicy.CAP])
+@pytest.mark.parametrize("theoretical", ["100", "500"])
+def test_progression_at_or_above_broker_max_resets_before_execution(
+    engine: Engine, gw: FakeGateway, policy: VolumeMaxPolicy, theoretical: str
+) -> None:
+    """Catches rejecting/capping a progressed lot instead of starting a fresh cycle."""
     with session_factory(engine).begin() as s:
         state = ProgressionState(
-            mode=RiskMode.ANTI_MARTINGALE, base_lot=D("0.01"), theoretical_lot=D("500")
+            mode=RiskMode.ANTI_MARTINGALE,
+            base_lot=D("0.01"),
+            theoretical_lot=D(theoretical),
+            wins=12,
+            losses=3,
         )
         repo.create_progression(s, KEY, state)
-    out = send(orchestrator(engine, gw))
-    assert (out.state, out.reason) == (SignalState.BROKER_REJECTED, "VolumeAboveMaximum")
-    assert gw.orders == []
-
-
-def test_volume_above_max_with_cap_policy(engine: Engine, gw: FakeGateway) -> None:
-    with session_factory(engine).begin() as s:
-        state = ProgressionState(
-            mode=RiskMode.ANTI_MARTINGALE, base_lot=D("0.01"), theoretical_lot=D("500")
-        )
-        repo.create_progression(s, KEY, state)
-    out = send(orchestrator(engine, gw, volume_max_policy=VolumeMaxPolicy.CAP))
+    out = send(orchestrator(engine, gw, volume_max_policy=policy))
     assert out.state is SignalState.OPEN
     (t,) = trades(engine)
-    assert (t.theoretical_lot, t.executed_lot, t.volume_capped_at_max) == (D(500), D(100), True)
+    assert (t.base_lot, t.theoretical_lot, t.executed_lot, t.volume_capped_at_max) == (
+        D("0.01"),
+        D("0.01"),
+        D("0.01"),
+        False,
+    )
+    assert progression(engine) == (
+        ProgressionState.initial(RiskMode.ANTI_MARTINGALE, D("0.01")),
+        2,
+    )
+    with session_factory(engine).begin() as s:
+        event = s.scalar(select(AuditEvent).where(AuditEvent.event_type == "PROGRESSION_RESET"))
+        assert event is not None
+        assert event.payload == {
+            "scope_key": KEY,
+            "symbol": "XAUUSD",
+            "old_theoretical_lot": theoretical,
+            "new_theoretical_lot": "0.01",
+            "broker_volume_max": "100",
+        }
 
 
 def test_invalid_signal_is_recorded_with_reason(engine: Engine, gw: FakeGateway) -> None:

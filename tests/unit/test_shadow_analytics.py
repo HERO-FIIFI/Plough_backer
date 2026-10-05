@@ -2,13 +2,15 @@
 
 import subprocess
 import sys
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 from plough_backer.analytics.metrics import TradeRecord, breakdown, compute
-from plough_backer.enums import RiskMode, ShadowStatus, TradeOutcome, VolumeMaxPolicy
-from plough_backer.shadow.engine import replay
+from plough_backer.enums import Direction, RiskMode, ShadowStatus, TradeOutcome, VolumeMaxPolicy
+from plough_backer.risk.progression import ProgressionState
+from plough_backer.shadow.engine import ShadowSignal, replay
 from tests.fakes import GOLD
 
 ROOT = Path(__file__).parents[2]
@@ -73,6 +75,36 @@ def test_empty_replay_keeps_starting_balance() -> None:
     )
     assert all(x.balance == D(100) and x.trades == 0 for x in p.values())
     assert GOLD.volume_min == D("0.01")
+
+
+def test_shadow_resets_exact_broker_max_before_next_trade() -> None:
+    """Catches Shadow Mode drifting from the live broker-limit reset rule."""
+    limited = replace(GOLD, volume_max=D("0.02"))
+    signal = ShadowSignal(
+        symbol="XAUUSD",
+        direction=Direction.BUY,
+        entry=D("4500"),
+        stop_loss=D("4492"),
+        take_profit=D("4512"),
+        outcome=TradeOutcome.WIN,
+        spec=limited,
+    )
+    portfolios = replay(
+        [signal, signal],
+        starting_balance=D("100"),
+        profit=lambda _s, _d, lot, _o, _c: D("1200") * lot,
+        margin=lambda *_a: D(0),
+        max_policy=VolumeMaxPolicy.REJECT,
+    )
+
+    mode1 = portfolios[RiskMode.ANTI_MARTINGALE]
+    assert (mode1.balance, mode1.max_lot) == (D("124"), D("0.01"))
+    assert mode1.states["XAUUSD"] == ProgressionState(
+        mode=RiskMode.ANTI_MARTINGALE,
+        base_lot=D("0.01"),
+        theoretical_lot=D("0.02"),
+        wins=1,
+    )
 
 
 # --- metrics ------------------------------------------------------------------------------

@@ -6,6 +6,7 @@ from fractions import Fraction
 import pytest
 
 from plough_backer.enums import RiskMode, TradeOutcome
+from plough_backer.risk import progression
 from plough_backer.risk.progression import ProgressionState, settle
 
 D = Decimal
@@ -163,3 +164,40 @@ def test_mode_change_resets_to_base() -> None:
     # §33: switching method starts the new method from base state.
     s = ProgressionState.initial(RiskMode.MARTINGALE, D("0.5"))
     assert (s.theoretical_lot, s.wins, s.losses, s.mode5_block_trade_count) == (D("0.5"), 0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    ("theoretical", "volume_min", "volume_max"),
+    [("25", "0.01", "25"), ("55", "0.1", "50"), ("100", "0.5", "100")],
+)
+def test_progression_resets_at_dynamic_broker_maximum(
+    theoretical: str, volume_min: str, volume_max: str
+) -> None:
+    """Catches using a hard-coded maximum or allowing an exact-max lot to execute."""
+    state = ProgressionState(
+        mode=RiskMode.DOUBLE_EVERY_FIVE,
+        base_lot=D("0.01"),
+        theoretical_lot=D(theoretical),
+        wins=9,
+        losses=2,
+        mode5_block_trade_count=4,
+    )
+
+    reset, happened = progression.reset_at_broker_limit(
+        state, volume_min=D(volume_min), volume_max=D(volume_max)
+    )
+
+    assert happened
+    assert reset == ProgressionState.initial(RiskMode.DOUBLE_EVERY_FIVE, D(volume_min))
+
+
+def test_progression_below_broker_maximum_is_unchanged() -> None:
+    """Catches resetting one broker step early."""
+    state = ProgressionState(
+        mode=RiskMode.ALWAYS_DOUBLE, base_lot=D("0.01"), theoretical_lot=D("24.99"), wins=8
+    )
+    result, happened = progression.reset_at_broker_limit(
+        state, volume_min=D("0.01"), volume_max=D("25")
+    )
+    assert not happened
+    assert result is state

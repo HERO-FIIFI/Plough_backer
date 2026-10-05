@@ -7,8 +7,10 @@ is organised around and (2) open questions that a later phase must NOT resolve s
 ## 1. Extracted requirements
 
 **Invariants (§72):** INV-01…INV-15. The ones that drive the architecture:
-- only a SETTLED executed trade moves progression (INV-02). Equity Lock blocks, broker
-  rejections, paused/skipped/MT5-unavailable signals never do (INV-03/04/05, §21, §34, §57);
+- only a SETTLED executed trade applies a WIN/LOSS rule to progression (INV-02). Separately,
+  sizing resets an at/above-maximum progression cycle to the current broker `volume_min`.
+  Equity Lock blocks, broker rejections, paused/skipped/MT5-unavailable signals never apply
+  trade outcomes (INV-03/04/05, §21, §34, §57);
 - `theoretical_lot` (Decimal, progression-owned) ≠ `executed_lot` (broker-normalized); normalization never writes back (INV-06/07, §16–17);
 - risk is computed from the broker symbol spec + SL distance, and it never gates execution. Only Equity Lock and broker impossibility can stop a trade (INV-09–12, §19);
 - one Telegram message → at most one MT5 execution, including across restarts (INV-01, INV-15, §24, §27);
@@ -61,7 +63,7 @@ DEMO_READY ≠ live authorization.
 | Q-02 | Phase 1 | **BREAKEVEN/OTHER in modes 4 and 5.** §22 says progression is unchanged. §15 says Mode 4 doubles "after every settled trade" and Mode 5 counts "SETTLED trades". Does a BREAKEVEN/OTHER settlement double Mode 4, or count toward Mode 5's five? |
 | Q-03 | Phase 8 | **Outcome classification.** Is WIN/LOSS decided by the sign of net profit (after swap and commission) or of gross profit? Is there a breakeven tolerance? Is a manual close in profit a WIN or OTHER (§29 lists manual closes)? How are partial closes handled? |
 | Q-04 | Phase 4 | **TP for non-Gold symbols.** Only Gold's rule (TP2) is specified. Which TP do synthetics and Forex use? For Gold, is a lone unlabelled "TP" treated as TP1 and therefore rejected under missing_tp2_policy=REJECT? |
-| Q-05 | Phase 2 | **Normalization edges.** When theoretical lot > `volume_max`: clamp to max (logged) or refuse as a broker constraint? Tie rule: the §16 table (0.015→0.02) implies ROUND_HALF_UP. Confirm. Is the step grid anchored at 0 or at `volume_min`, for brokers where min isn't a multiple of step? Deriv synthetics often have low `volume_max` values and a per-symbol total-volume limit (`volume_limit`), so modes 2 and 4 will reach the cap early. This decision is urgent for them. Confirm against real Deriv symbol specs in Phase 5. (Display only, not semantics: the §31 dashboard's 4-decimal lot format would hide 0.00075; lots will be formatted from each symbol's `volume_step` precision.) |
+| Q-05 | Phase 2 | **Decided.** Before progression sizing, `theoretical_lot >= volume_max` resets the complete cycle to the symbol's current `volume_min` and emits `PROGRESSION_RESET`; the maximum is not traded. Normalization remains ROUND_HALF_UP on a zero-anchored grid, and non-progression callers retain explicit CAP/REJECT behavior. Confirm real Deriv symbol specs in Phase 5, including any separate per-symbol aggregate `volume_limit`. |
 | Q-06 | Phase 2 | **Risk entry price for MARKET orders.** Use the signal's entry or the live ask/bid? "BUY GOLD NOW" has no entry at all. Is R-multiple based on planned or actual fill? |
 | Q-07 | Phase 2 | **Equity Lock detail.** Block when projected == lock? (The §20 example only shows strict <.) Does projected equity subtract the SL risk of other open positions, or only this trade's? |
 | Q-08 | Phase 9 | **Shadow Mode inputs.** Starting virtual balance? How are outcomes found for signals the real account didn't trade (paused, Equity Lock, broker-rejected, PAPER): price-history simulation (which data?) or skip? Is shadow P/L priced at SL/TP levels or at the real realized close (manual closes, slippage)? Which margin model decides SHADOW_FAILED (leverage source)? Does Equity Lock apply to shadows? §48 shows all six, including the active mode, as virtual portfolios. Confirm. |
