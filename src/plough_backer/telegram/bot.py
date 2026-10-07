@@ -63,6 +63,7 @@ def build_application(token: str, commands: AdminCommands) -> Application:  # ty
         "start": lambda u, a: commands.dashboard(u),
         "dashboard": lambda u, a: commands.dashboard(u),
         "status": lambda u, a: commands.status(u),
+        "accounts": lambda u, a: commands.accounts(u),
         "mode": lambda u, a: commands.mode_menu(u),
         "lock": lambda u, a: commands.lock_ask(u, a[0]) if a else commands.lock_menu(u),
         "pause": lambda u, a: commands.set_status(u, TradingStatus.PAUSED),

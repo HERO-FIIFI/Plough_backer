@@ -16,6 +16,10 @@ class ConfigurationError(PloughBackerError):
     """Configuration is missing or invalid. Fail at startup, never mid-trade."""
 
 
+class SetupTokenInvalid(PloughBackerError):
+    """A credential setup token is unknown, expired, or was already consumed."""
+
+
 class SignalRejected(PloughBackerError):
     """Fail-closed rejection of a Telegram message (README §10)."""
 

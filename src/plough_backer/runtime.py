@@ -7,6 +7,7 @@ missed-message catch-up (§58) and health status (§56).
 
 import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -23,12 +24,12 @@ from plough_backer.analytics.reports import (
     weekly_report,
 )
 from plough_backer.config import Settings, SourcesConfig
-from plough_backer.enums import AuditEventType, TradingStatus
+from plough_backer.enums import AuditEventType, ExecutionMode, RiskMode, TradingStatus
 from plough_backer.persistence import repositories as repo
 from plough_backer.persistence.models import AuditEvent, Signal, Trade
-from plough_backer.resilience import MT5Monitor
+from plough_backer.resilience import MemoryPressureMonitor, MT5Monitor
 from plough_backer.telegram.notifications import trade_closed
-from plough_backer.trading.executor import Orchestrator
+from plough_backer.trading.executor import MultiAccountOutcome, Orchestrator
 from plough_backer.trading.settlement import Settler
 
 log = logging.getLogger(__name__)
@@ -63,10 +64,14 @@ class Runtime:
         monitor: MT5Monitor | None,
         notify: Notify,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        memory_monitor: MemoryPressureMonitor | None = None,
+        account_services: dict[str, tuple[MT5Monitor, Settler]] | None = None,
     ) -> None:
         self._settings, self._sessions = settings, sessions
         self._orchestrator, self._settler, self._monitor = orchestrator, settler, monitor
         self._notify, self._now = notify, clock
+        self._memory_monitor = memory_monitor or MemoryPressureMonitor()
+        self._account_services = account_services if account_services is not None else {}
         self.last_reconciliation_at: datetime | None = None
         self.scheduler_alive = False
         self.telegram_connected: Callable[[], bool] = lambda: False
@@ -108,6 +113,19 @@ class Runtime:
     # --- periodic jobs --------------------------------------------------------------------
 
     async def reconcile(self) -> None:
+        if self._account_services:
+            for account_id, (monitor, settler) in list(self._account_services.items()):
+                connected = await asyncio.to_thread(monitor.ensure)
+                if not connected:
+                    continue
+                settlements = await asyncio.to_thread(settler.reconcile)
+                for settlement in settlements:
+                    await self._notify(
+                        f"Account: {account_id}\n\n"
+                        f"{trade_closed(settlement, RiskMode(settlement.risk_mode))}"
+                    )
+            self.last_reconciliation_at = self._now()
+            return
         if self._settler is None or self._monitor is None:
             return
         connected = await asyncio.to_thread(self._monitor.ensure)
@@ -195,7 +213,11 @@ class Runtime:
             database, status, last_signal = False, TradingStatus.STOPPED, None
         return Health(
             telegram=self.telegram_connected(),
-            mt5=bool(self._monitor and self._monitor.connected),
+            mt5=(
+                all(bool(monitor.connected) for monitor, _ in self._account_services.values())
+                if self._account_services
+                else bool(self._monitor and self._monitor.connected)
+            ),
             database=database,
             scheduler=self.scheduler_alive,
             trading=status,
@@ -220,7 +242,7 @@ class Runtime:
         self.scheduler_alive = True
         try:
             while True:
-                for job in (self.reconcile, self.send_due_reports):
+                for job in (self.reconcile, self.send_due_reports, self.check_memory):
                     try:
                         await job()
                     except Exception:
@@ -228,6 +250,12 @@ class Runtime:
                 await asyncio.sleep(self._settings.reconcile_interval_seconds)
         finally:
             self.scheduler_alive = False
+
+    async def check_memory(self) -> None:
+        """Send only threshold transitions; repeated high readings stay quiet."""
+        message = self._memory_monitor.sample()
+        if message is not None:
+            await self._notify(f"⚠️ {message}")
 
 
 def _tz(name: str) -> Any:
@@ -238,13 +266,31 @@ def _tz(name: str) -> Any:
 
 async def run(settings: Settings, sessions: sessionmaker[Session]) -> None:  # pragma: no cover
     """Wire real MT5 + Telegram. Not unit-tested: needs credentials and a terminal (Phase 12)."""
-    from plough_backer.config import load_sources, load_symbols
+    from plough_backer.account_credentials import (
+        CredentialVault,
+        SetupLinkService,
+        WindowsDPAPIProtector,
+    )
+    from plough_backer.config import (
+        load_account_environment,
+        load_accounts,
+        load_sources,
+        load_symbols,
+        resolve_account_credentials,
+    )
+    from plough_backer.credential_server import CredentialSetupServer
+    from plough_backer.exceptions import ConfigurationError
     from plough_backer.telegram import notifications
     from plough_backer.telegram.bot import build_application
     from plough_backer.telegram.handlers import AdminCommands
     from plough_backer.telegram.listener import build_listener, warm_entities
-    from plough_backer.trading.executor import ExecutionPolicy
+    from plough_backer.trading.executor import (
+        ExecutionPolicy,
+        MultiAccountOrchestrator,
+        SignalIngestor,
+    )
     from plough_backer.trading.mt5_client import MT5Client, load_mt5
+    from plough_backer.trading.process_gateway import MT5WorkerSpec, ProcessBrokerGateway
     from plough_backer.trading.settlement import SettlementPolicy
 
     # Type narrowing only: main() already refused to start if runtime_missing() was non-empty.
@@ -256,11 +302,145 @@ async def run(settings: Settings, sessions: sessionmaker[Session]) -> None:  # p
     assert settings.risk_entry_source is not None
     assert settings.breakeven_tolerance is not None
     assert settings.manual_close_is_other is not None
-    symbols, sources = load_symbols(), load_sources()
+    symbols, sources, accounts = load_symbols(), load_sources(), load_accounts()
+    account_environment = load_account_environment(os.environ)
     names = {s.id: s.name for s in sources.sources}
 
     gateway = monitor = settler = None
-    if settings.mt5_login and settings.mt5_password and settings.mt5_server:
+    gateways: dict[str, Any] = {}
+    account_services: dict[str, tuple[MT5Monitor, Settler]] = {}
+    methods: dict[str, RiskMode] = {}
+    setup_server: CredentialSetupServer | None = None
+    credential_setup: SetupLinkService | None = None
+    vault: CredentialVault | None = None
+    account_dashboard: dict[str, tuple[Any, RiskMode]] = {}
+    policy = ExecutionPolicy(
+        execution_mode=settings.execution_mode,
+        progression_scope=settings.progression_scope,
+        volume_max_policy=settings.volume_max_policy,
+        risk_entry=settings.risk_entry_source,
+    )
+    if accounts.enabled_masters:
+        executors: dict[str, Orchestrator] = {}
+        vault = CredentialVault(sessions, WindowsDPAPIProtector())
+
+        def configured_credentials(account: Any) -> Any:
+            saved = vault.load(account.id)
+            if saved is not None:
+                return saved
+            try:
+                return resolve_account_credentials(account, account_environment)
+            except ConfigurationError:
+                return None
+
+        def account_executor(account: Any, account_gateway: Any) -> Orchestrator:
+            return Orchestrator(
+                sessions=sessions,
+                gateway=account_gateway,
+                symbols=symbols,
+                sources=sources,
+                policy=policy,
+                account_id=account.id,
+                risk_mode=account.method,
+            )
+
+        for account in accounts.enabled_masters:
+            methods[account.id] = account.method
+            credentials = configured_credentials(account)
+            if credentials is None or settings.execution_mode is ExecutionMode.PAPER:
+                executors[account.id] = account_executor(account, None)
+                continue
+            assert account.deviation_points is not None
+            assert account.magic is not None
+            isolated_gateway = ProcessBrokerGateway(
+                MT5WorkerSpec(
+                    account_id=account.id,
+                    login=credentials.login,
+                    password=credentials.password.get_secret_value(),
+                    server=credentials.server,
+                    deviation_points=account.deviation_points,
+                    magic=account.magic,
+                    terminal_path=account.terminal_path,
+                )
+            )
+            account_monitor = MT5Monitor(isolated_gateway, sessions)
+            account_settler = Settler(
+                sessions=sessions,
+                gateway=isolated_gateway,
+                account_id=account.id,
+                policy=SettlementPolicy(
+                    breakeven_tolerance=settings.breakeven_tolerance,
+                    manual_close_is_other=settings.manual_close_is_other,
+                ),
+            )
+            gateways[account.id] = isolated_gateway
+            account_dashboard[account.id] = (isolated_gateway, account.method)
+            account_services[account.id] = (account_monitor, account_settler)
+            executors[account.id] = account_executor(account, isolated_gateway)
+        orchestrator: Any = MultiAccountOrchestrator(
+            ingestor=SignalIngestor(sessions=sessions, symbols=symbols, sources=sources),
+            executors=executors,
+        )
+        gateway = next(iter(gateways.values()), None)
+
+        accounts_by_id = {account.id: account for account in accounts.enabled_masters}
+
+        def activate_account(account_id: str) -> None:
+            account = accounts_by_id[account_id]
+            credentials = vault.load(account_id)
+            if credentials is None or settings.execution_mode is ExecutionMode.PAPER:
+                return
+            assert settings.breakeven_tolerance is not None
+            assert settings.manual_close_is_other is not None
+            assert account.deviation_points is not None
+            assert account.magic is not None
+            replacement = ProcessBrokerGateway(
+                MT5WorkerSpec(
+                    account_id=account.id,
+                    login=credentials.login,
+                    password=credentials.password.get_secret_value(),
+                    server=credentials.server,
+                    deviation_points=account.deviation_points,
+                    magic=account.magic,
+                    terminal_path=account.terminal_path,
+                )
+            )
+            account_monitor = MT5Monitor(replacement, sessions)
+            account_settler = Settler(
+                sessions=sessions,
+                gateway=replacement,
+                account_id=account.id,
+                policy=SettlementPolicy(
+                    breakeven_tolerance=settings.breakeven_tolerance,
+                    manual_close_is_other=settings.manual_close_is_other,
+                ),
+            )
+            previous = gateways.get(account_id)
+            gateways[account_id] = replacement
+            account_dashboard[account_id] = (replacement, account.method)
+            account_services[account_id] = (account_monitor, account_settler)
+            orchestrator.replace_executor(
+                account_id, account_executor(account, replacement)
+            )
+            if previous is not None:
+                previous.shutdown()
+
+        credential_setup = SetupLinkService(
+            sessions=sessions,
+            vault=vault,
+            base_url=settings.account_setup_base_url,
+            allowed_account_ids=set(accounts_by_id),
+            on_saved=activate_account,
+        )
+        setup_server = CredentialSetupServer(
+            credential_setup,
+            host=settings.account_setup_host,
+            port=settings.account_setup_port,
+            tls_cert=settings.account_setup_tls_cert,
+            tls_key=settings.account_setup_tls_key,
+        )
+        setup_server.start()
+    elif settings.mt5_login and settings.mt5_password and settings.mt5_server:
         assert settings.mt5_deviation_points is not None
         assert settings.mt5_magic is not None
         gateway = MT5Client(
@@ -283,18 +463,14 @@ async def run(settings: Settings, sessions: sessionmaker[Session]) -> None:  # p
         )
         await asyncio.to_thread(monitor.ensure)
 
-    orchestrator = Orchestrator(
-        sessions=sessions,
-        gateway=gateway,
-        symbols=symbols,
-        sources=sources,
-        policy=ExecutionPolicy(
-            execution_mode=settings.execution_mode,
-            progression_scope=settings.progression_scope,
-            volume_max_policy=settings.volume_max_policy,
-            risk_entry=settings.risk_entry_source,
-        ),
-    )
+    if not accounts.enabled_masters:
+        orchestrator = Orchestrator(
+            sessions=sessions,
+            gateway=gateway,
+            symbols=symbols,
+            sources=sources,
+            policy=policy,
+        )
     admin_id = settings.telegram_admin_user_id
     runtime_ref: list[Runtime] = []
     commands = AdminCommands(
@@ -303,6 +479,10 @@ async def run(settings: Settings, sessions: sessionmaker[Session]) -> None:  # p
         admin_ids={admin_id},
         execution_mode=settings.execution_mode,
         status=lambda: runtime_ref[0].status_text(),
+        account_gateways=account_dashboard,
+        master_accounts=accounts.enabled_masters,
+        credential_setup=credential_setup,
+        credential_present=vault.has if vault is not None else None,
     )
     bot = build_application(settings.telegram_bot_token.get_secret_value(), commands)
 
@@ -320,10 +500,27 @@ async def run(settings: Settings, sessions: sessionmaker[Session]) -> None:  # p
         settler=settler,
         monitor=monitor,
         notify=notify,
+        account_services=account_services,
     )
     runtime_ref.append(runtime)
 
     async def on_outcome(source_id: str, outcome: Any) -> None:
+        if isinstance(outcome, MultiAccountOutcome):
+            if outcome.intake is not None:
+                message = notifications.for_outcome(
+                    outcome.intake, names.get(source_id, source_id), settings.default_risk_mode
+                )
+                if message:
+                    await notify(message)
+            for account_id, account_outcome in outcome.accounts.items():
+                message = notifications.for_outcome(
+                    account_outcome,
+                    names.get(source_id, source_id),
+                    methods[account_id],
+                )
+                if message:
+                    await notify(f"Account: {account_id}\n\n{message}")
+            return
         with sessions.begin() as s:
             mode = controls.risk_mode(s)
         message = notifications.for_outcome(outcome, names.get(source_id, source_id), mode)
@@ -368,5 +565,10 @@ async def run(settings: Settings, sessions: sessionmaker[Session]) -> None:  # p
         await bot.updater.stop()
         await bot.stop()
         await bot.shutdown()
-        if gateway is not None:
+        if setup_server is not None:
+            setup_server.stop()
+        if gateways:
+            for isolated_gateway in gateways.values():
+                isolated_gateway.shutdown()
+        elif gateway is not None:
             gateway.shutdown()

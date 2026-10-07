@@ -1,6 +1,8 @@
 """Bounded retry/backoff (§57, §58) and MT5 connection tracking with audited transitions."""
 
 import logging
+import os
+import sys
 import time
 from collections.abc import Callable
 from typing import Protocol
@@ -12,6 +14,67 @@ from plough_backer.exceptions import BrokerError
 from plough_backer.persistence import repositories as repo
 
 log = logging.getLogger(__name__)
+
+
+def _system_memory_percent() -> float:
+    """Physical memory usage without an extra runtime dependency."""
+    if sys.platform == "win32":
+        import ctypes
+
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("length", ctypes.c_ulong),
+                ("memory_load", ctypes.c_ulong),
+                ("total_physical", ctypes.c_ulonglong),
+                ("available_physical", ctypes.c_ulonglong),
+                ("total_page_file", ctypes.c_ulonglong),
+                ("available_page_file", ctypes.c_ulonglong),
+                ("total_virtual", ctypes.c_ulonglong),
+                ("available_virtual", ctypes.c_ulonglong),
+                ("available_extended_virtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatus()
+        status.length = ctypes.sizeof(status)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            raise OSError("GlobalMemoryStatusEx failed")
+        return float(status.memory_load)
+
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    total_pages = os.sysconf("SC_PHYS_PAGES")
+    available_pages = os.sysconf("SC_AVPHYS_PAGES")
+    return (1 - available_pages / total_pages) * 100 if page_size and total_pages else 0.0
+
+
+class MemoryPressureMonitor:
+    """Alert once as RAM crosses 75/85/95%, then re-arm after recovery below 75%."""
+
+    def __init__(self, read_percent: Callable[[], float] = _system_memory_percent) -> None:
+        self._read_percent = read_percent
+        self._level = 0
+
+    @staticmethod
+    def _at(percent: float) -> int:
+        if percent >= 95:
+            return 3
+        if percent >= 85:
+            return 2
+        if percent >= 75:
+            return 1
+        return 0
+
+    def sample(self) -> str | None:
+        percent = self._read_percent()
+        level = self._at(percent)
+        previous = self._level
+        self._level = level
+        if level > previous:
+            threshold = (75, 85, 95)[level - 1]
+            label = ("WARNING", "HIGH", "CRITICAL")[level - 1]
+            return f"{label}: VPS memory reached {percent:.1f}% (threshold {threshold}%)."
+        if level == 0 and previous > 0:
+            return f"VPS memory recovered to {percent:.1f}% (below 75%)."
+        return None
 
 
 def backoff_delays(attempts: int, base: float, cap: float) -> list[float]:

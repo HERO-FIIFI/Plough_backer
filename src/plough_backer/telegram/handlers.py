@@ -10,12 +10,15 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from typing import Protocol
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from plough_backer import controls
+from plough_backer.config import TradingAccountConfig
 from plough_backer.enums import ExecutionMode, RiskMode, TradeOutcome, TradingStatus
+from plough_backer.exceptions import BrokerError
 from plough_backer.persistence.models import ProgressionStateRow, Trade
 from plough_backer.telegram.notifications import lot, mode_label, money
 from plough_backer.trading.gateway import BrokerGateway
@@ -34,6 +37,10 @@ class Reply:
 NOT_AUTHORIZED = Reply("⛔ Not authorized.")
 
 
+class CredentialSetup(Protocol):
+    def issue(self, account_id: str, requested_by: int) -> str: ...
+
+
 class AdminCommands:
     def __init__(
         self,
@@ -43,6 +50,10 @@ class AdminCommands:
         admin_ids: set[int],
         execution_mode: ExecutionMode,
         status: Callable[[], str] | None = None,
+        account_gateways: dict[str, tuple[BrokerGateway, RiskMode]] | None = None,
+        master_accounts: list[TradingAccountConfig] | None = None,
+        credential_setup: CredentialSetup | None = None,
+        credential_present: Callable[[str], bool] | None = None,
     ) -> None:
         if not admin_ids:
             raise ValueError("at least one Telegram admin id is required (§54)")
@@ -51,6 +62,10 @@ class AdminCommands:
         self._gateway = gateway
         self._admins = admin_ids
         self._mode = execution_mode
+        self._account_gateways = account_gateways if account_gateways is not None else {}
+        self._master_accounts = {account.id: account for account in master_accounts or []}
+        self._credential_setup = credential_setup
+        self._credential_present = credential_present or (lambda _: False)
 
     def authorized(self, user_id: int | None) -> bool:
         ok = user_id is not None and user_id in self._admins
@@ -63,6 +78,25 @@ class AdminCommands:
         if not self.authorized(user_id):
             return NOT_AUTHORIZED
         return Reply(self._status() if self._status else "Status unavailable.")
+
+    def accounts(self, user_id: int | None) -> Reply:
+        """List masters; passwords are accepted only by the secure setup page."""
+        if not self.authorized(user_id):
+            return NOT_AUTHORIZED
+        if not self._master_accounts:
+            return Reply("No master accounts are configured in config/accounts.yaml.")
+        lines = ["MASTER ACCOUNTS", ""]
+        buttons: list[list[Button]] = []
+        for account in self._master_accounts.values():
+            saved = self._credential_present(account.id)
+            lines.append(
+                f"{'CREDENTIALS SAVED' if saved else 'SETUP REQUIRED'} | "
+                f"{account.id} | Method {int(account.method)}"
+            )
+            label = "Replace credentials" if saved else "Set credentials"
+            buttons.append([(label, f"account:setup:{account.id}")])
+        lines += ["", "Passwords are entered only on the private one-time setup page."]
+        return Reply("\n".join(lines), buttons)
 
     # --- dashboard (§31) ------------------------------------------------------------------
 
@@ -104,6 +138,23 @@ class AdminCommands:
             mode_label(mode),
             "",
         ]
+        if self._account_gateways:
+            lines += ["Accounts:"]
+            for account_id, (account_gateway, account_mode) in self._account_gateways.items():
+                try:
+                    account_connected = account_gateway.is_connected()
+                    snapshot = (
+                        account_gateway.account_snapshot() if account_connected else None
+                    )
+                except BrokerError:
+                    account_connected, snapshot = False, None
+                marker = "ONLINE" if account_connected else "OFFLINE"
+                lines.append(
+                    f"{marker} {account_id} | Method {int(account_mode)} | "
+                    f"Balance {money(snapshot.balance if snapshot else None)} | "
+                    f"Equity {money(snapshot.equity if snapshot else None)}"
+                )
+            lines.append("")
         for row in scopes:
             lines.append(f"{row.scope_key}: {lot(row.theoretical_lot)}")
         lines += [
@@ -119,13 +170,16 @@ class AdminCommands:
             if status is TradingStatus.RUNNING
             else ("▶️ Resume", "status:RUNNING")
         )
-        return Reply(
+        reply = Reply(
             "\n".join(lines),
             [
                 [("⚙️ Risk Mode", "mode:menu"), ("🔒 Equity Lock", "lock:menu")],
                 [pause, ("⛔ Stop", "status:STOPPED")],
             ],
         )
+        if self._master_accounts:
+            reply.buttons.insert(1, [("Accounts", "account:menu")])
+        return reply
 
     # --- risk mode (§32, §33) -------------------------------------------------------------
 
@@ -225,6 +279,8 @@ class AdminCommands:
     def callback(self, user_id: int | None, data: str) -> Reply:
         parts = data.split(":")
         match parts:
+            case ["account", "menu"]:
+                return self.accounts(user_id)
             case ["mode", "menu"]:
                 return self.mode_menu(user_id)
             case ["mode", "ask", cur, new]:
@@ -246,6 +302,17 @@ class AdminCommands:
                 return self.lock_confirm(user_id, None)
             case ["status", status]:
                 return self.set_status(user_id, TradingStatus(status))
+            case ["account", "setup", account_id]:
+                if not self.authorized(user_id):
+                    return NOT_AUTHORIZED
+                if account_id not in self._master_accounts or self._credential_setup is None:
+                    return Reply("Account credential setup is unavailable.")
+                assert user_id is not None
+                link = self._credential_setup.issue(account_id, user_id)
+                return Reply(
+                    "Open this private link within 10 minutes. It works once.\n\n"
+                    f"{link}\n\nNever send an MT5 password in Telegram."
+                )
             case ["cancel"]:
                 return Reply("Cancelled.") if self.authorized(user_id) else NOT_AUTHORIZED
         return Reply("Unknown action.") if self.authorized(user_id) else NOT_AUTHORIZED

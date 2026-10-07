@@ -1,0 +1,23 @@
+# Direct MT5 masters run in isolated workers. Add one or more masters per method.
+# Secrets live in .env as <credentials_prefix>_LOGIN/_PASSWORD/_SERVER.
+accounts: []
+
+# Example (remove `accounts: []`, uncomment, and repeat for methods 2-6):
+# accounts:
+#   - id: method-1-primary
+#     name: Method 1 Primary
+#     method: 1
+#     role: MASTER
+#     terminal_path: 'C:\MT5\Method1\terminal64.exe'
+#     credentials_prefix: MT5_METHOD1_PRIMARY
+#     magic: 71001
+#     deviation_points: 20
+#
+#   # Followers are monitored as copier metadata; this app does not open another terminal.
+#   - id: method-1-follower-a
+#     name: Method 1 Copier Follower
+#     method: 1
+#     role: COPIER_FOLLOWER
+#     master_account_id: method-1-primary
+#     copier_provider: your-cloud-copier
+#     external_reference: follower-reference

@@ -20,7 +20,7 @@ from plough_backer.exceptions import MT5Unavailable
 from plough_backer.main import EXIT_CONFIG_ERROR, main
 from plough_backer.persistence.database import session_factory
 from plough_backer.persistence.models import AuditEvent, Trade
-from plough_backer.resilience import MT5Monitor, backoff_delays, retry
+from plough_backer.resilience import MemoryPressureMonitor, MT5Monitor, backoff_delays, retry
 from plough_backer.runtime import Runtime
 from plough_backer.trading.settlement import SettlementPolicy, Settler
 from tests.conftest import paper_settings
@@ -97,10 +97,29 @@ def test_monitor_gives_up_after_bounded_attempts(engine: Engine) -> None:
     assert not MT5Monitor(term, session_factory(engine), attempts=3, sleep=lambda _: None).ensure()
 
 
+def test_memory_pressure_alerts_once_per_escalation_and_recovers() -> None:
+    readings = iter([74, 75, 80, 85, 90, 95, 99, 70])
+    monitor = MemoryPressureMonitor(read_percent=lambda: next(readings))
+
+    assert monitor.sample() is None
+    assert "75%" in (monitor.sample() or "")
+    assert monitor.sample() is None
+    assert "85%" in (monitor.sample() or "")
+    assert monitor.sample() is None
+    assert "95%" in (monitor.sample() or "")
+    assert monitor.sample() is None
+    assert "recovered" in (monitor.sample() or "").lower()
+
+
 # --- runtime ------------------------------------------------------------------------------
 
 
-def make_runtime(engine: Engine, gw: FakeGateway, sent: list[str]) -> Runtime:
+def make_runtime(
+    engine: Engine,
+    gw: FakeGateway,
+    sent: list[str],
+    memory_monitor: MemoryPressureMonitor | None = None,
+) -> Runtime:
     async def notify(message: str) -> None:
         sent.append(message)
 
@@ -117,6 +136,7 @@ def make_runtime(engine: Engine, gw: FakeGateway, sent: list[str]) -> Runtime:
         monitor=MT5Monitor(gw, sessions, sleep=lambda _: None),  # type: ignore[arg-type]
         notify=notify,
         clock=lambda: NOW,
+        memory_monitor=memory_monitor,
     )
 
 
@@ -193,6 +213,28 @@ def test_status_text(engine: Engine, gw: FakeGateway) -> None:
     assert "Database: 🟢" in text
     assert "Trading: RUNNING" in text
     assert "12:00:00 UTC" in text
+
+
+def test_runtime_sends_memory_escalation_and_recovery_alerts(
+    engine: Engine, gw: FakeGateway
+) -> None:
+    readings = iter([75, 80, 85, 95, 70])
+    sent: list[str] = []
+    runtime = make_runtime(
+        engine,
+        gw,
+        sent,
+        MemoryPressureMonitor(read_percent=lambda: next(readings)),
+    )
+
+    for _ in range(5):
+        asyncio.run(runtime.check_memory())
+
+    assert len(sent) == 4
+    assert "75%" in sent[0]
+    assert "85%" in sent[1]
+    assert "95%" in sent[2]
+    assert "recovered" in sent[3].lower()
 
 
 def test_runtime_refuses_to_start_with_open_decisions(

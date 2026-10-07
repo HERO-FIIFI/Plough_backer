@@ -7,12 +7,14 @@ Settings that decide trading semantics (execution mode, risk mode, Equity Lock) 
 defaults: they must be stated, never inferred (README §6, §76).
 """
 
+from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Self
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
+from dotenv import dotenv_values
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -25,6 +27,7 @@ from pydantic import (
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from plough_backer.enums import (
+    AccountRole,
     AssetClass,
     ExecutionMode,
     MissingTp2Policy,
@@ -91,6 +94,11 @@ class Settings(DatabaseSettings):
     mt5_terminal_path: str | None = None
     telegram_session_path: str = "data/telegram"
     reconcile_interval_seconds: int = Field(default=30, ge=5)
+    account_setup_base_url: str = "http://127.0.0.1:8765"
+    account_setup_host: str = "127.0.0.1"
+    account_setup_port: int = Field(default=8765, ge=0, le=65535)
+    account_setup_tls_cert: Path | None = None
+    account_setup_tls_key: Path | None = None
 
     def runtime_missing(self) -> list[str]:
         """Settings the live runtime needs that are unset. Never defaulted (§76)."""
@@ -127,16 +135,10 @@ class Settings(DatabaseSettings):
 
     @model_validator(mode="after")
     def _cross_field_rules(self) -> Self:
-        if self.execution_mode in (ExecutionMode.DEMO, ExecutionMode.LIVE):
-            missing = [
-                name
-                for name in ("mt5_login", "mt5_password", "mt5_server")
-                if getattr(self, name) is None
-            ]
-            if missing:
-                raise ValueError(
-                    f"EXECUTION_MODE={self.execution_mode} requires {', '.join(missing).upper()}"
-                )
+        if (self.account_setup_tls_cert is None) != (self.account_setup_tls_key is None):
+            raise ValueError(
+                "ACCOUNT_SETUP_TLS_CERT and ACCOUNT_SETUP_TLS_KEY must be set together"
+            )
         if self.equity_lock_enabled:
             if self.equity_lock_value is None:
                 raise ValueError("EQUITY_LOCK_ENABLED=true requires EQUITY_LOCK_VALUE")
@@ -234,6 +236,98 @@ class SourcesConfig(_Strict):
         return self
 
 
+class TradingAccountConfig(_Strict):
+    """One directly managed MT5 master or one externally managed copier follower."""
+
+    id: str = Field(min_length=1, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    name: str = Field(min_length=1)
+    method: RiskMode
+    role: AccountRole = AccountRole.MASTER
+    enabled: bool = True
+
+    # Direct master fields. Secrets are resolved from PREFIX_LOGIN/PASSWORD/SERVER.
+    terminal_path: str | None = None
+    credentials_prefix: str | None = Field(default=None, pattern=r"^[A-Z][A-Z0-9_]*$")
+    magic: int | None = Field(default=None, gt=0)
+    deviation_points: int | None = Field(default=None, ge=0)
+
+    # External follower fields. V1 records these for honest monitoring only.
+    master_account_id: str | None = None
+    copier_provider: str | None = None
+    external_reference: str | None = None
+
+    @model_validator(mode="after")
+    def _role_fields(self) -> Self:
+        required: tuple[str, ...]
+        if self.role is AccountRole.MASTER:
+            required = ("terminal_path", "credentials_prefix", "magic", "deviation_points")
+        else:
+            required = ("master_account_id", "copier_provider", "external_reference")
+        missing = [name for name in required if getattr(self, name) in (None, "")]
+        if missing:
+            raise ValueError(f"{self.role} account requires {', '.join(missing)}")
+        return self
+
+
+class AccountsConfig(_Strict):
+    accounts: list[TradingAccountConfig] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _relationships_and_resources_are_unambiguous(self) -> Self:
+        by_id: dict[str, TradingAccountConfig] = {}
+        for account in self.accounts:
+            if account.id in by_id:
+                raise ValueError(f"duplicate account id {account.id!r}")
+            by_id[account.id] = account
+
+        enabled_masters = [
+            account
+            for account in self.accounts
+            if account.enabled and account.role is AccountRole.MASTER
+        ]
+        for field in ("terminal_path", "credentials_prefix", "magic"):
+            seen: set[str] = set()
+            for account in enabled_masters:
+                raw = getattr(account, field)
+                value = str(raw).casefold()
+                if value in seen:
+                    raise ValueError(f"enabled masters cannot share {field}: {raw}")
+                seen.add(value)
+
+        for follower in self.accounts:
+            if follower.role is not AccountRole.COPIER_FOLLOWER:
+                continue
+            master = by_id.get(follower.master_account_id or "")
+            if master is None or master.role is not AccountRole.MASTER:
+                raise ValueError(f"follower {follower.id!r} references an unknown master")
+            if follower.method is not master.method:
+                raise ValueError(f"follower {follower.id!r} must use the same method as its master")
+        return self
+
+    def masters_for(self, method: RiskMode) -> list[TradingAccountConfig]:
+        return [
+            account
+            for account in self.accounts
+            if account.enabled
+            and account.role is AccountRole.MASTER
+            and account.method is method
+        ]
+
+    @property
+    def enabled_masters(self) -> list[TradingAccountConfig]:
+        return [
+            account
+            for account in self.accounts
+            if account.enabled and account.role is AccountRole.MASTER
+        ]
+
+
+class AccountCredentials(_Strict):
+    login: int
+    password: SecretStr
+    server: str = Field(min_length=1)
+
+
 def _load_yaml[M: BaseModel](path: Path, model: type[M]) -> M:
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -248,3 +342,77 @@ def load_symbols(path: Path = Path("config/symbols.yaml")) -> SymbolsConfig:
 
 def load_sources(path: Path = Path("config/sources.yaml")) -> SourcesConfig:
     return _load_yaml(path, SourcesConfig)
+
+
+def load_accounts(path: Path = Path("config/accounts.yaml")) -> AccountsConfig:
+    if not path.exists():
+        return AccountsConfig()
+    return _load_yaml(path, AccountsConfig)
+
+
+def resolve_account_credentials(
+    account: TradingAccountConfig, environ: Mapping[str, str]
+) -> AccountCredentials:
+    """Resolve one master's secrets without ever including their values in an error."""
+    if account.role is not AccountRole.MASTER or account.credentials_prefix is None:
+        raise ConfigurationError(f"account {account.id!r} is not a directly managed master")
+    prefix = account.credentials_prefix
+    names = {field: f"{prefix}_{field.upper()}" for field in ("login", "password", "server")}
+    missing = [env_name for env_name in names.values() if not environ.get(env_name)]
+    if missing:
+        raise ConfigurationError(
+            f"account {account.id!r} is missing environment variables: {', '.join(missing)}"
+        )
+    try:
+        return AccountCredentials(
+            login=int(environ[names["login"]]),
+            password=SecretStr(environ[names["password"]]),
+            server=environ[names["server"]],
+        )
+    except (ValueError, ValidationError):
+        raise ConfigurationError(f"account {account.id!r} has invalid credentials") from None
+
+
+def load_account_environment(
+    environ: Mapping[str, str], env_file: Path = Path(".env")
+) -> dict[str, str]:
+    """Merge dynamic account variables from .env with the real environment winning."""
+    file_values = dotenv_values(env_file) if env_file.exists() else {}
+    merged = {key: value for key, value in file_values.items() if value is not None}
+    merged.update(environ)
+    return merged
+
+
+def validate_broker_configuration(
+    settings: Settings, accounts: AccountsConfig, environ: Mapping[str, str]
+) -> list[AccountCredentials]:
+    """Validate either isolated account credentials or the legacy single-account fields."""
+    if settings.execution_mode is ExecutionMode.PAPER:
+        return []
+    if accounts.enabled_masters:
+        found = []
+        for account in accounts.enabled_masters:
+            assert account.credentials_prefix is not None
+            names = [
+                f"{account.credentials_prefix}_{part}"
+                for part in ("LOGIN", "PASSWORD", "SERVER")
+            ]
+            present = [bool(environ.get(name)) for name in names]
+            if any(present) and not all(present):
+                raise ConfigurationError(
+                    f"account {account.id!r} has incomplete environment credentials"
+                )
+            if all(present):
+                found.append(resolve_account_credentials(account, environ))
+        return found
+    missing = [
+        name
+        for name in ("mt5_login", "mt5_password", "mt5_server")
+        if getattr(settings, name) is None
+    ]
+    if missing:
+        raise ConfigurationError(
+            f"EXECUTION_MODE={settings.execution_mode} requires enabled accounts or "
+            f"{', '.join(missing).upper()}"
+        )
+    return []

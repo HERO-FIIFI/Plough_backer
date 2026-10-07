@@ -7,6 +7,7 @@ Exits non-zero before touching Telegram/MT5 if any open trading decision is unse
 
 import asyncio
 import logging
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -14,7 +15,15 @@ from collections.abc import Callable
 from sqlalchemy import Engine
 
 from plough_backer import SPEC_VERSION, runtime
-from plough_backer.config import Settings, load_settings, load_sources, load_symbols
+from plough_backer.config import (
+    Settings,
+    load_account_environment,
+    load_accounts,
+    load_settings,
+    load_sources,
+    load_symbols,
+    validate_broker_configuration,
+)
 from plough_backer.exceptions import ConfigurationError, MigrationStateError
 from plough_backer.logging import configure_logging
 from plough_backer.persistence.database import (
@@ -58,9 +67,15 @@ def serve(
 
 def bootstrap(settings: Settings) -> Engine:
     """Validate config + database. Raises ConfigurationError / MigrationStateError."""
-    configure_logging(settings.log_level, settings.secret_values())
     symbols = load_symbols()
     sources = load_sources()
+    accounts = load_accounts()
+    account_environment = load_account_environment(os.environ)
+    account_credentials = validate_broker_configuration(
+        settings, accounts, account_environment
+    )
+    account_secrets = [item.password.get_secret_value() for item in account_credentials]
+    configure_logging(settings.log_level, [*settings.secret_values(), *account_secrets])
     engine = make_engine(settings.database_url)
     assert_migrations_current(engine)
     log.info(
@@ -73,6 +88,7 @@ def bootstrap(settings: Settings) -> Engine:
             "equity_lock_enabled": settings.equity_lock_enabled,
             "symbols": len(symbols.symbols),
             "sources": len(sources.sources),
+            "master_accounts": len(accounts.enabled_masters),
         },
     )
     return engine
@@ -86,6 +102,8 @@ def main() -> int:
         print(f"startup refused: {exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
     missing = settings.runtime_missing()
+    if load_accounts().enabled_masters:
+        missing = [name for name in missing if name not in {"MT5_DEVIATION_POINTS", "MT5_MAGIC"}]
     if missing:  # README §76: open trading decisions are never defaulted
         engine.dispose()
         print(f"startup refused: set {', '.join(missing)} in .env", file=sys.stderr)

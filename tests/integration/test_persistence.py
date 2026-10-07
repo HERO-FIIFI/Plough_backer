@@ -154,11 +154,14 @@ def test_transitions_are_persisted(engine: Engine) -> None:
     assert signal.rejection_reason == "STOP_LOSS_MISSING"
 
 
-def _trade(signal: Signal, fingerprint: str = "f" * 64) -> Trade:
+def _trade(
+    signal: Signal, fingerprint: str = "f" * 64, account_id: str = "default"
+) -> Trade:
     zero = D(0)
     return Trade(
         signal_pk=signal.id,
         signal_id=signal.signal_id,
+        account_id=account_id,
         signal_fingerprint=fingerprint,
         progression_scope_key="k",
         telegram_source_id="gold",
@@ -205,6 +208,24 @@ def test_fingerprint_executes_once_even_after_restart(engine: Engine, db_url: st
             repo.claim_execution(s, _trade(signal))
         assert len(s.scalars(select(Trade)).all()) == 1
     engine2.dispose()
+
+
+def test_same_fingerprint_executes_once_per_account(engine: Engine) -> None:
+    with session_factory(engine).begin() as s:
+        signal = _ingest(s)
+        assert signal is not None
+        repo.claim_execution(s, _trade(signal, account_id="method_1_a"))
+        repo.claim_execution(s, _trade(signal, account_id="method_1_b"))
+
+    with session_factory(engine).begin() as s:
+        assert repo.fingerprint_executed(s, "f" * 64, account_id="method_1_a")
+        assert repo.fingerprint_executed(s, "f" * 64, account_id="method_1_b")
+        assert not repo.fingerprint_executed(s, "f" * 64, account_id="method_2")
+        signal = s.scalar(select(Signal))
+        assert signal is not None
+        with pytest.raises(DuplicateSignal):
+            repo.claim_execution(s, _trade(signal, account_id="method_1_a"))
+        assert len(s.scalars(select(Trade)).all()) == 2
 
 
 def test_trade_decimals_and_timestamps_round_trip(engine: Engine) -> None:

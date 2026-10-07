@@ -8,14 +8,31 @@ replays safe (INV-01).
 import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from typing import Protocol
 
 from telethon import TelegramClient, events
 
 from plough_backer.config import SourcesConfig
-from plough_backer.trading.executor import EditOutcome, Orchestrator, Outcome
+from plough_backer.trading.executor import EditOutcome, MultiAccountOutcome, Outcome
 
-OnOutcome = Callable[[str, Outcome], Awaitable[None]]  # (source_id, outcome)
+OnOutcome = Callable[[str, Outcome | MultiAccountOutcome], Awaitable[None]]
 OnEdit = Callable[[EditOutcome], Awaitable[None]]
+
+
+class MessageOrchestrator(Protocol):
+    def process_message(
+        self,
+        *,
+        source_id: str,
+        message_id: int,
+        message_time: datetime,
+        text: str,
+        received_at: datetime,
+    ) -> Outcome | MultiAccountOutcome: ...
+
+    def process_edit(
+        self, *, source_id: str, message_id: int, text: str, edited_at: datetime
+    ) -> EditOutcome | None: ...
 
 
 def chat_map(sources: SourcesConfig) -> dict[int, str]:
@@ -44,7 +61,7 @@ def build_listener(
     api_hash: str,
     session_path: str,
     sources: SourcesConfig,
-    orchestrator: Orchestrator,
+    orchestrator: MessageOrchestrator,
     on_outcome: OnOutcome,
     on_edit: OnEdit,
 ) -> TelegramClient:

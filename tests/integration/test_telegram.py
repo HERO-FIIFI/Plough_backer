@@ -1,5 +1,6 @@
 """Phase 7: admin bot logic, notifications, edit policy, and offline library wiring."""
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 from sqlalchemy import Engine, select
 
 from plough_backer import controls
+from plough_backer.config import TradingAccountConfig, load_accounts
 from plough_backer.enums import (
     AuditEventType,
     ExecutionMode,
@@ -15,7 +17,7 @@ from plough_backer.enums import (
     SignalState,
     TradingStatus,
 )
-from plough_backer.persistence.database import session_factory
+from plough_backer.persistence.database import PROJECT_ROOT, session_factory
 from plough_backer.persistence.models import AuditEvent, Signal
 from plough_backer.telegram import notifications as n
 from plough_backer.telegram.handlers import NOT_AUTHORIZED, AdminCommands
@@ -98,6 +100,67 @@ def test_dashboard_shows_account_and_method(admin: AdminCommands) -> None:
 
 
 # --- mode change with confirmation (§32, §33) ---------------------------------------------
+
+
+def test_dashboard_lists_every_direct_master(engine: Engine) -> None:
+    first, second = FakeGateway(), FakeGateway()
+    second.account = replace(second.account, balance=Decimal("60"), equity=Decimal("59"))
+    commands = AdminCommands(
+        sessions=session_factory(engine),
+        gateway=first,
+        admin_ids={ADMIN},
+        execution_mode=ExecutionMode.DEMO,
+        account_gateways={
+            "method-1-primary": (first, RiskMode.ANTI_MARTINGALE),
+            "method-2-primary": (second, RiskMode.MARTINGALE),
+        },
+    )
+
+    text = commands.dashboard(ADMIN).text
+
+    assert "method-1-primary | Method 1" in text
+    assert "method-2-primary | Method 2" in text
+    assert "Balance $60.00" in text
+
+
+def test_accounts_dashboard_issues_password_link_only_for_authorized_admin(
+    engine: Engine,
+) -> None:
+    class Setup:
+        def issue(self, account_id: str, requested_by: int) -> str:
+            assert requested_by == ADMIN
+            return f"https://setup.example.com/setup/token-for-{account_id}"
+
+    accounts = load_accounts(PROJECT_ROOT / "config/accounts.yaml")
+    account = TradingAccountConfig.model_validate(
+        {
+            "id": "method-1-primary",
+            "name": "Method 1 Primary",
+            "method": 1,
+            "role": "MASTER",
+            "terminal_path": r"C:\MT5\Method1\terminal64.exe",
+            "credentials_prefix": "MT5_METHOD1",
+            "magic": 71001,
+            "deviation_points": 20,
+        }
+    )
+    commands = AdminCommands(
+        sessions=session_factory(engine),
+        gateway=None,
+        admin_ids={ADMIN},
+        execution_mode=ExecutionMode.DEMO,
+        master_accounts=[*accounts.enabled_masters, account],
+        credential_setup=Setup(),
+    )
+
+    menu = commands.accounts(ADMIN)
+    assert "method-1-primary" in menu.text
+    assert menu.buttons == [[("Set credentials", "account:setup:method-1-primary")]]
+    assert [("Accounts", "account:menu")] in commands.dashboard(ADMIN).buttons
+    assert commands.callback(ADMIN, "account:menu") == menu
+    link = commands.callback(ADMIN, "account:setup:method-1-primary")
+    assert "https://setup.example.com/setup/token-for-method-1-primary" in link.text
+    assert commands.accounts(STRANGER) == NOT_AUTHORIZED
 
 
 def test_mode_change_needs_confirmation(admin: AdminCommands, engine: Engine) -> None:
@@ -271,6 +334,7 @@ def test_bot_application_builds_with_all_commands(admin: AdminCommands) -> None:
         "start",
         "dashboard",
         "status",
+        "accounts",
         "mode",
         "lock",
         "pause",

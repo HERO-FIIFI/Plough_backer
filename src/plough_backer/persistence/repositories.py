@@ -69,8 +69,18 @@ def _columns(state: ProgressionState) -> dict[str, Any]:
     }
 
 
-def create_progression(session: Session, scope_key: str, state: ProgressionState) -> int:
-    session.add(ProgressionStateRow(scope_key=scope_key, version=1, **_columns(state)))
+def create_progression(
+    session: Session,
+    scope_key: str,
+    state: ProgressionState,
+    *,
+    account_id: str = "default",
+) -> int:
+    session.add(
+        ProgressionStateRow(
+            scope_key=scope_key, account_id=account_id, version=1, **_columns(state)
+        )
+    )
     session.flush()
     return 1
 
@@ -145,8 +155,14 @@ def transition_signal(
 # --- Executions (INV-01, INV-15) ----------------------------------------------------------
 
 
-def fingerprint_executed(session: Session, fingerprint: str) -> bool:
-    found = session.scalar(select(Trade.id).where(Trade.signal_fingerprint == fingerprint))
+def fingerprint_executed(
+    session: Session, fingerprint: str, *, account_id: str = "default"
+) -> bool:
+    found = session.scalar(
+        select(Trade.id).where(
+            Trade.account_id == account_id, Trade.signal_fingerprint == fingerprint
+        )
+    )
     return found is not None
 
 
@@ -165,9 +181,21 @@ def claim_execution(session: Session, trade: Trade) -> None:
 
 
 def append_audit(
-    session: Session, event_type: AuditEventType, *, actor: str | None = None, **payload: Any
+    session: Session,
+    event_type: AuditEventType,
+    *,
+    actor: str | None = None,
+    account_id: str | None = None,
+    **payload: Any,
 ) -> None:
-    session.add(AuditEvent(event_type=event_type, actor=actor, payload=_jsonable(payload)))
+    session.add(
+        AuditEvent(
+            event_type=event_type,
+            actor=actor,
+            account_id=account_id,
+            payload=_jsonable(payload),
+        )
+    )
 
 
 # --- Settings (Q-17: env seeds an empty DB; persisted values win afterwards) ---------------

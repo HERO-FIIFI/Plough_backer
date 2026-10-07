@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import JSON, ForeignKey, MetaData, UniqueConstraint
+from sqlalchemy import JSON, ForeignKey, LargeBinary, MetaData, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from plough_backer.persistence.database import DecimalText, UTCDateTime
@@ -102,11 +102,18 @@ class Trade(Base):
     """Trade journal (§42) + latency timestamps (§50). Created at EXECUTION_REQUESTED."""
 
     __tablename__ = "trades"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id", "signal_fingerprint", name="uq_trades_account_fingerprint"
+        ),
+        UniqueConstraint("account_id", "mt5_position_id", name="uq_trades_account_position"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     signal_pk: Mapped[int] = mapped_column(ForeignKey("signals.id"), index=True)
     signal_id: Mapped[str]
-    signal_fingerprint: Mapped[str] = mapped_column(unique=True)
+    account_id: Mapped[str] = mapped_column(index=True, default="default", server_default="default")
+    signal_fingerprint: Mapped[str]
     progression_scope_key: Mapped[str] = mapped_column(index=True)
 
     telegram_source_id: Mapped[str]
@@ -151,7 +158,7 @@ class Trade(Base):
 
     mt5_order_id: Mapped[int | None]
     mt5_deal_id: Mapped[int | None]
-    mt5_position_id: Mapped[int | None] = mapped_column(unique=True)
+    mt5_position_id: Mapped[int | None]
     execution_retcode: Mapped[int | None]
     execution_message: Mapped[str | None]
 
@@ -185,6 +192,7 @@ class ProgressionStateRow(Base):
     __tablename__ = "progression_states"
 
     scope_key: Mapped[str] = mapped_column(primary_key=True)
+    account_id: Mapped[str] = mapped_column(index=True, default="default", server_default="default")
     mode: Mapped[int]
     base_lot: Mapped[Decimal]
     theoretical_lot: Mapped[Decimal]
@@ -201,7 +209,34 @@ class AuditEvent(Base):
     __tablename__ = "audit_events"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[str | None] = mapped_column(index=True)
     event_type: Mapped[str] = mapped_column(index=True)  # enums.AuditEventType
     actor: Mapped[str | None]  # e.g. Telegram user id for MODE_CHANGED (§33)
     payload: Mapped[dict[str, Any]]
     at: Mapped[datetime] = mapped_column(default=utcnow, index=True)
+
+
+class AccountCredential(Base):
+    """Encrypted MT5 credentials. The password is never stored as plaintext."""
+
+    __tablename__ = "account_credentials"
+
+    account_id: Mapped[str] = mapped_column(primary_key=True)
+    login: Mapped[int]
+    server: Mapped[str]
+    encrypted_password: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
+
+
+class AccountSetupToken(Base):
+    """Hashed, expiring, single-use link issued by an authorized Telegram admin."""
+
+    __tablename__ = "account_setup_tokens"
+
+    token_hash: Mapped[str] = mapped_column(primary_key=True)
+    account_id: Mapped[str] = mapped_column(index=True)
+    requested_by: Mapped[str]
+    expires_at: Mapped[datetime] = mapped_column(index=True)
+    used_at: Mapped[datetime | None]
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)

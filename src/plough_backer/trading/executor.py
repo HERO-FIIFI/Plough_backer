@@ -33,6 +33,7 @@ from plough_backer.enums import (
     ProgressionScope,
     RejectionReason,
     RiskEntrySource,
+    RiskMode,
     SignalState,
     TradingStatus,
     VolumeMaxPolicy,
@@ -95,6 +96,28 @@ class EditOutcome:
     mt5_ticket: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedSignal:
+    """A Telegram signal parsed once and ready for account-specific execution."""
+
+    signal_pk: int
+    signal_id: str
+    signal: NormalizedSignal
+    signal_fingerprint: str
+    labelled_take_profits: dict[int, Decimal]
+    received_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class MultiAccountOutcome:
+    """The independently recorded result for every enabled master account."""
+
+    signal_id: str | None
+    source_id: str
+    accounts: dict[str, Outcome]
+    intake: Outcome | None = None
+
+
 def _broker_state(exc: BrokerError) -> SignalState:
     """Broker said no (constraint/retcode) vs the request could not complete (§21)."""
     if isinstance(exc, ExecutionFailed | MT5Unavailable):
@@ -118,6 +141,8 @@ class Orchestrator:
         symbols: SymbolsConfig,
         sources: SourcesConfig,
         policy: ExecutionPolicy,
+        account_id: str = "default",
+        risk_mode: RiskMode | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._sessions = sessions
@@ -125,6 +150,8 @@ class Orchestrator:
         self._symbols = symbols
         self._sources = {s.id: s for s in sources.sources}
         self._policy = policy
+        self._account_id = account_id
+        self._risk_mode = risk_mode
         self._now = clock
         # Serializes the whole read-size-claim step (§26); DB BEGIN IMMEDIATE is the 2nd guard.
         self._lock = threading.Lock()
@@ -173,6 +200,66 @@ class Orchestrator:
                 executed=trade is not None,
             )
             return EditOutcome(signal.signal_id, executed=trade is not None, mt5_ticket=ticket)
+
+    def execute_prepared(self, prepared: PreparedSignal) -> Outcome:
+        """Execute a previously parsed signal for this account only.
+
+        The global Signal row describes Telegram intake. Account outcomes live in account-
+        scoped trades and audit events, so one account cannot overwrite another's result.
+        """
+        out = Outcome(
+            SignalState.VALIDATED,
+            prepared.signal_id,
+            prepared.signal.source_id,
+            signal=prepared.signal,
+        )
+        with self._lock, self._sessions.begin() as s:
+            signal = s.get(Signal, prepared.signal_pk)
+            assert signal is not None
+            if repo.fingerprint_executed(
+                s, prepared.signal_fingerprint, account_id=self._account_id
+            ):
+                out.state, out.reason = (
+                    SignalState.REJECTED_DUPLICATE,
+                    "FINGERPRINT_ALREADY_EXECUTED",
+                )
+                repo.append_audit(
+                    s,
+                    AuditEventType.SIGNAL_DUPLICATE,
+                    account_id=self._account_id,
+                    signal_id=signal.signal_id,
+                )
+                return out
+            status = controls.trading_status(s)
+            if status is TradingStatus.PAUSED:
+                out.state = SignalState.SKIPPED_PAUSED
+                return out
+            if status is TradingStatus.STOPPED:
+                out.state = SignalState.SKIPPED_STOPPED
+                return out
+            gw = self._gateway
+            if gw is None or not gw.is_connected():
+                out.state = SignalState.SKIPPED_MT5_UNAVAILABLE
+                return out
+            try:
+                out, request, trade_id = self._size_and_claim(
+                    s,
+                    gw,
+                    signal,
+                    prepared.signal,
+                    prepared.signal_fingerprint,
+                    prepared.labelled_take_profits,
+                    out,
+                    prepared.received_at,
+                    transition_signal=False,
+                )
+            except BrokerError as exc:
+                out.state, out.reason = _broker_state(exc), type(exc).__name__
+                out.extra["detail"] = str(exc)
+                return out
+        if request is None or trade_id is None:
+            return out
+        return self._submit(out, request, trade_id, transition_signal=False)
 
     # --- transaction 1 --------------------------------------------------------------------
 
@@ -311,18 +398,24 @@ class Orchestrator:
         tps: dict[int, Decimal],
         out: Outcome,
         received_at: datetime,
+        *,
+        transition_signal: bool = True,
     ) -> tuple[Outcome, OrderRequest | None, int | None]:
         assert ns.symbol_mt5 is not None
         spec = gw.symbol_specification(ns.symbol_mt5)  # §28 steps 2-4
         account = gw.account_snapshot()
-        mode = controls.risk_mode(s)
+        mode = self._risk_mode or controls.risk_mode(s)
 
         key = scope_key(self._policy.progression_scope, ns.source_id, ns.symbol_mt5)
+        if self._account_id != "default":
+            key = f"{self._account_id}|{key}"
         loaded = repo.load_progression(s, key)
         if loaded is None or loaded[0].mode is not mode:
             state = ProgressionState.initial(mode, spec.volume_min)  # §14 base = volume_min
             if loaded is None:
-                version = repo.create_progression(s, key, state)
+                version = repo.create_progression(
+                    s, key, state, account_id=self._account_id
+                )
             else:  # mode changed since this scope last traded (§33)
                 version = repo.save_progression(s, key, state, expected_version=loaded[1])
         else:
@@ -337,6 +430,7 @@ class Orchestrator:
             repo.append_audit(
                 s,
                 AuditEventType.PROGRESSION_RESET,
+                account_id=self._account_id,
                 scope_key=key,
                 symbol=ns.symbol_mt5,
                 old_theoretical_lot=previous_state.theoretical_lot,
@@ -372,7 +466,8 @@ class Orchestrator:
                     "executed_lot": volume.executable,
                 },
             )
-        repo.transition_signal(s, signal, SignalState.SIZED)
+        if transition_signal:
+            repo.transition_signal(s, signal, SignalState.SIZED)
 
         entry = self._risk_entry(gw, ns)
         risk = out.risk = assess_risk(
@@ -394,17 +489,25 @@ class Orchestrator:
             risk_to_sl=risk.risk_to_sl,
         )
         if not lock.allowed:
-            return self._end(s, signal, out, SignalState.BLOCKED_EQUITY_LOCK), None, None
-        repo.transition_signal(s, signal, SignalState.EQUITY_LOCK_CHECKED)
+            if transition_signal:
+                return self._end(s, signal, out, SignalState.BLOCKED_EQUITY_LOCK), None, None
+            out.state = SignalState.BLOCKED_EQUITY_LOCK
+            return out, None, None
+        if transition_signal:
+            repo.transition_signal(s, signal, SignalState.EQUITY_LOCK_CHECKED)
 
         if self._policy.execution_mode is ExecutionMode.PAPER:
             # Q-09: no settlement source for paper trades yet — sizing is journaled only.
-            return self._end(s, signal, out, SignalState.SKIPPED_PAPER), None, None
+            if transition_signal:
+                return self._end(s, signal, out, SignalState.SKIPPED_PAPER), None, None
+            out.state = SignalState.SKIPPED_PAPER
+            return out, None, None
 
         now = self._now()
         trade = Trade(
             signal_pk=signal.id,
             signal_id=signal.signal_id,
+            account_id=self._account_id,
             signal_fingerprint=fp,
             progression_scope_key=key,
             telegram_source_id=ns.source_id,
@@ -447,17 +550,30 @@ class Orchestrator:
         try:
             repo.claim_execution(s, trade)
         except DuplicateSignal:
+            if not transition_signal:
+                out.state = SignalState.REJECTED_DUPLICATE
+                out.reason = "FINGERPRINT_ALREADY_EXECUTED"
             return (
-                self._end(
-                    s, signal, out, SignalState.REJECTED_DUPLICATE, "FINGERPRINT_ALREADY_EXECUTED"
+                (
+                    self._end(
+                        s,
+                        signal,
+                        out,
+                        SignalState.REJECTED_DUPLICATE,
+                        "FINGERPRINT_ALREADY_EXECUTED",
+                    )
+                    if transition_signal
+                    else out
                 ),
                 None,
                 None,
             )
-        repo.transition_signal(s, signal, SignalState.EXECUTION_REQUESTED)
+        if transition_signal:
+            repo.transition_signal(s, signal, SignalState.EXECUTION_REQUESTED)
         repo.append_audit(
             s,
             AuditEventType.TRADE_REQUESTED,
+            account_id=self._account_id,
             signal_id=signal.signal_id,
             executed_lot=volume.executable,
         )
@@ -486,7 +602,14 @@ class Orchestrator:
 
     # --- transactions 2 + 3 ---------------------------------------------------------------
 
-    def _submit(self, out: Outcome, request: OrderRequest, trade_id: int) -> Outcome:
+    def _submit(
+        self,
+        out: Outcome,
+        request: OrderRequest,
+        trade_id: int,
+        *,
+        transition_signal: bool = True,
+    ) -> Outcome:
         assert self._gateway is not None
         try:
             result = self._gateway.submit_order(request)
@@ -501,9 +624,17 @@ class Orchestrator:
                 signal = s.get(Signal, trade.signal_pk)
                 assert signal is not None
                 repo.append_audit(
-                    s, AuditEventType.TRADE_REJECTED, signal_id=trade.signal_id, error=str(exc)
+                    s,
+                    AuditEventType.TRADE_REJECTED,
+                    account_id=self._account_id,
+                    signal_id=trade.signal_id,
+                    error=str(exc),
                 )
-                return self._end(s, signal, out, state, type(exc).__name__, str(exc))
+                if transition_signal:
+                    return self._end(s, signal, out, state, type(exc).__name__, str(exc))
+                out.state, out.reason = state, type(exc).__name__
+                out.extra["detail"] = str(exc)
+                return out
 
         out.result = result
         with self._sessions.begin() as s:
@@ -517,20 +648,31 @@ class Orchestrator:
             trade.actual_entry = result.price
             signal = s.get(Signal, trade.signal_pk)
             assert signal is not None
-            repo.transition_signal(s, signal, SignalState.EXECUTED)
+            if transition_signal:
+                repo.transition_signal(s, signal, SignalState.EXECUTED)
             if not request.order_type.is_pending:
                 # MT5: a position's id is the ticket of the order that opened it.
                 trade.mt5_position_id = result.order_id
                 trade.opened_at = trade.position_confirmed_at = result.response_at
-                repo.transition_signal(s, signal, SignalState.OPEN)
+                if transition_signal:
+                    repo.transition_signal(s, signal, SignalState.OPEN)
             repo.append_audit(
                 s,
                 AuditEventType.TRADE_EXECUTED,
+                account_id=self._account_id,
                 signal_id=trade.signal_id,
                 mt5_order_id=result.order_id,
                 executed_lot=result.volume,
             )
-            out.state = signal.state  # type: ignore[assignment]
+            out.state = (
+                SignalState(signal.state)
+                if transition_signal
+                else (
+                    SignalState.EXECUTED
+                    if request.order_type.is_pending
+                    else SignalState.OPEN
+                )
+            )
             out.executed_lot = result.volume
         return out
 
@@ -569,3 +711,181 @@ class Orchestrator:
         if detail:
             out.extra["detail"] = detail
         return out
+
+
+class SignalIngestor:
+    """Persist and parse each Telegram message exactly once before account fan-out."""
+
+    def __init__(
+        self,
+        *,
+        sessions: sessionmaker[Session],
+        symbols: SymbolsConfig,
+        sources: SourcesConfig,
+    ) -> None:
+        self._sessions = sessions
+        self._symbols = symbols
+        self._sources = {source.id: source for source in sources.sources}
+        self._lock = threading.Lock()
+
+    def prepare_message(
+        self,
+        *,
+        source_id: str,
+        message_id: int,
+        message_time: datetime,
+        text: str,
+        received_at: datetime,
+    ) -> PreparedSignal | Outcome:
+        with self._lock, self._sessions.begin() as s:
+            signal = repo.ingest_message(
+                s,
+                source_id=source_id,
+                source_message_id=message_id,
+                source_timestamp=message_time,
+                received_at=received_at,
+                raw_message=text,
+            )
+            if signal is None:
+                repo.append_audit(
+                    s,
+                    AuditEventType.SIGNAL_DUPLICATE,
+                    source_id=source_id,
+                    source_message_id=message_id,
+                    reason="MESSAGE_ALREADY_INGESTED",
+                )
+                return Outcome(
+                    SignalState.REJECTED_DUPLICATE,
+                    source_id=source_id,
+                    reason="MESSAGE_ALREADY_INGESTED",
+                )
+
+            repo.append_audit(s, AuditEventType.SIGNAL_RECEIVED, signal_id=signal.signal_id)
+            out = Outcome(SignalState.RECEIVED, signal.signal_id, source_id)
+            source = self._sources.get(source_id)
+            if source is None or not source.enabled:
+                return Orchestrator._end(
+                    s,
+                    signal,
+                    out,
+                    SignalState.REJECTED_INVALID_SIGNAL,
+                    RejectionReason.UNKNOWN_SOURCE,
+                )
+            repo.transition_signal(s, signal, SignalState.SOURCE_VALIDATED)
+            try:
+                parsed = get_parser(source.parser_profile)(
+                    text,
+                    symbols=self._symbols,
+                    signal_id=signal.signal_id,
+                    source_id=source_id,
+                    source_message_id=message_id,
+                    source_timestamp=message_time,
+                )
+            except ParseRejected as exc:
+                return Orchestrator._end(
+                    s, signal, out, SignalState.REJECTED_PARSE, exc.reason, exc.detail
+                )
+            except InvalidSignal as exc:
+                return Orchestrator._end(
+                    s,
+                    signal,
+                    out,
+                    SignalState.REJECTED_INVALID_SIGNAL,
+                    exc.reason,
+                    exc.detail,
+                )
+
+            normalized = parsed.signal
+            signal_fingerprint = fingerprint(normalized)
+            Orchestrator._store_parsed(signal, normalized, signal_fingerprint)
+            for state in (
+                SignalState.PARSED,
+                SignalState.NORMALIZED,
+                SignalState.SYMBOL_RESOLVED,
+                SignalState.VALIDATED,
+                SignalState.DEDUPLICATED,
+            ):
+                repo.transition_signal(s, signal, state)
+            repo.append_audit(s, AuditEventType.SIGNAL_PARSED, signal_id=signal.signal_id)
+            return PreparedSignal(
+                signal_pk=signal.id,
+                signal_id=signal.signal_id,
+                signal=normalized,
+                signal_fingerprint=signal_fingerprint,
+                labelled_take_profits=parsed.labelled_take_profits,
+                received_at=received_at,
+            )
+
+
+class MultiAccountOrchestrator:
+    """Fan one parsed signal out to independently isolated account executors."""
+
+    def __init__(
+        self,
+        *,
+        ingestor: SignalIngestor,
+        executors: dict[str, Orchestrator],
+    ) -> None:
+        self._ingestor = ingestor
+        self._executors = dict(executors)
+        self._executors_lock = threading.Lock()
+
+    def replace_executor(self, account_id: str, executor: Orchestrator) -> None:
+        with self._executors_lock:
+            self._executors[account_id] = executor
+
+    def process_message(
+        self,
+        *,
+        source_id: str,
+        message_id: int,
+        message_time: datetime,
+        text: str,
+        received_at: datetime,
+    ) -> MultiAccountOutcome:
+        prepared = self._ingestor.prepare_message(
+            source_id=source_id,
+            message_id=message_id,
+            message_time=message_time,
+            text=text,
+            received_at=received_at,
+        )
+        if isinstance(prepared, Outcome):
+            return MultiAccountOutcome(
+                signal_id=prepared.signal_id,
+                source_id=source_id,
+                accounts={},
+                intake=prepared,
+            )
+
+        outcomes: dict[str, Outcome] = {}
+        with self._executors_lock:
+            executors = list(self._executors.items())
+        for account_id, executor in executors:
+            try:
+                outcomes[account_id] = executor.execute_prepared(prepared)
+            except Exception as exc:  # an unhealthy account must not block the remaining accounts
+                log.exception("account_execution_failed", extra={"account_id": account_id})
+                outcomes[account_id] = Outcome(
+                    state=SignalState.EXECUTION_FAILED,
+                    signal_id=prepared.signal_id,
+                    source_id=source_id,
+                    reason="ACCOUNT_EXECUTION_ERROR",
+                    signal=prepared.signal,
+                    extra={"detail": str(exc)},
+                )
+        return MultiAccountOutcome(prepared.signal_id, source_id, outcomes)
+
+    def process_edit(
+        self, *, source_id: str, message_id: int, text: str, edited_at: datetime
+    ) -> EditOutcome | None:
+        with self._executors_lock:
+            executor = next(iter(self._executors.values()), None)
+        if executor is None:
+            return None
+        return executor.process_edit(
+            source_id=source_id,
+            message_id=message_id,
+            text=text,
+            edited_at=edited_at,
+        )

@@ -11,6 +11,13 @@ class ExecutionMode(StrEnum):
     LIVE = "LIVE"
 
 
+class AccountRole(StrEnum):
+    """How an account participates in multi-account execution."""
+
+    MASTER = "MASTER"  # directly controlled by one isolated MT5 worker
+    COPIER_FOLLOWER = "COPIER_FOLLOWER"  # externally hosted; never assumed executed
+
+
 class Direction(StrEnum):
     BUY = "BUY"
     SELL = "SELL"
@@ -210,6 +217,8 @@ class AuditEventType(StrEnum):
     TRADE_SETTLED = "TRADE_SETTLED"
     MODE_CHANGED = "MODE_CHANGED"
     PROGRESSION_RESET = "PROGRESSION_RESET"
+    ACCOUNT_SETUP_LINK_ISSUED = "ACCOUNT_SETUP_LINK_ISSUED"
+    ACCOUNT_CREDENTIALS_UPDATED = "ACCOUNT_CREDENTIALS_UPDATED"
     EQUITY_LOCK_CHANGED = "EQUITY_LOCK_CHANGED"
     PAUSED = "PAUSED"
     RESUMED = "RESUMED"

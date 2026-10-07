@@ -3,8 +3,16 @@ from pathlib import Path
 
 import pytest
 
-from plough_backer.config import load_settings, load_sources, load_symbols
-from plough_backer.enums import AssetClass, ExecutionMode, ProgressionScope, RiskMode
+from plough_backer.config import (
+    load_account_environment,
+    load_accounts,
+    load_settings,
+    load_sources,
+    load_symbols,
+    resolve_account_credentials,
+    validate_broker_configuration,
+)
+from plough_backer.enums import AccountRole, AssetClass, ExecutionMode, ProgressionScope, RiskMode
 from plough_backer.exceptions import ConfigurationError
 from plough_backer.persistence.database import PROJECT_ROOT
 from tests.conftest import paper_settings
@@ -33,13 +41,19 @@ def test_live_is_never_inferred_from_env_value_case() -> None:
 
 @pytest.mark.parametrize("mode", ["DEMO", "LIVE"])
 def test_broker_modes_require_mt5_credentials(mode: str) -> None:
-    with pytest.raises(ConfigurationError, match="MT5_LOGIN, MT5_PASSWORD, MT5_SERVER"):
-        load_settings(**paper_settings(execution_mode=mode))
+    settings = load_settings(**paper_settings(execution_mode=mode))
+    accounts = load_accounts(PROJECT_ROOT / "config/accounts.yaml")
+    with pytest.raises(ConfigurationError, match="enabled accounts or MT5_LOGIN"):
+        validate_broker_configuration(settings, accounts, {})
 
 
 def test_config_error_never_echoes_secret_values() -> None:
+    settings = load_settings(
+        **paper_settings(execution_mode="DEMO", mt5_password="hunter2-secret")
+    )
+    accounts = load_accounts(PROJECT_ROOT / "config/accounts.yaml")
     with pytest.raises(ConfigurationError) as exc:
-        load_settings(**paper_settings(execution_mode="DEMO", mt5_password="hunter2-secret"))
+        validate_broker_configuration(settings, accounts, {})
     assert "hunter2-secret" not in str(exc.value)
 
 
@@ -116,3 +130,117 @@ def test_unknown_yaml_keys_are_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigurationError):
         load_symbols(path)
+
+
+def test_method_accepts_one_or_multiple_master_accounts(tmp_path: Path) -> None:
+    path = tmp_path / "accounts.yaml"
+    path.write_text(
+        "accounts:\n"
+        "  - {id: m1a, name: M1 A, method: 1, role: MASTER, enabled: true, "
+        "terminal_path: 'C:\\\\MT5\\\\m1a\\\\terminal64.exe', credentials_prefix: MT5_M1A, "
+        "magic: 101, deviation_points: 20}\n"
+        "  - {id: m1b, name: M1 B, method: 1, role: MASTER, enabled: true, "
+        "terminal_path: 'C:\\\\MT5\\\\m1b\\\\terminal64.exe', credentials_prefix: MT5_M1B, "
+        "magic: 102, deviation_points: 20}\n"
+        "  - {id: m2, name: M2, method: 2, role: MASTER, enabled: true, "
+        "terminal_path: 'C:\\\\MT5\\\\m2\\\\terminal64.exe', credentials_prefix: MT5_M2, "
+        "magic: 201, deviation_points: 20}\n",
+        encoding="utf-8",
+    )
+
+    accounts = load_accounts(path)
+
+    assert [a.id for a in accounts.masters_for(RiskMode.ANTI_MARTINGALE)] == ["m1a", "m1b"]
+    assert [a.id for a in accounts.masters_for(RiskMode.MARTINGALE)] == ["m2"]
+
+
+def test_copier_follower_must_reference_master_using_same_method(tmp_path: Path) -> None:
+    path = tmp_path / "accounts.yaml"
+    path.write_text(
+        "accounts:\n"
+        "  - {id: master, name: Master, method: 1, role: MASTER, enabled: true, "
+        "terminal_path: 'C:\\\\MT5\\\\master\\\\terminal64.exe', "
+        "credentials_prefix: MT5_MASTER, magic: 101, deviation_points: 20}\n"
+        "  - {id: follower, name: Follower, method: 2, role: COPIER_FOLLOWER, enabled: true, "
+        "master_account_id: master, copier_provider: pending, external_reference: ext-1}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match="same method"):
+        load_accounts(path)
+
+
+def test_enabled_masters_cannot_share_terminal_or_magic(tmp_path: Path) -> None:
+    path = tmp_path / "accounts.yaml"
+    path.write_text(
+        "accounts:\n"
+        "  - {id: one, name: One, method: 1, role: MASTER, enabled: true, "
+        "terminal_path: 'C:\\\\MT5\\\\same\\\\terminal64.exe', credentials_prefix: MT5_ONE, "
+        "magic: 101, deviation_points: 20}\n"
+        "  - {id: two, name: Two, method: 2, role: MASTER, enabled: true, "
+        "terminal_path: 'c:\\\\mt5\\\\SAME\\\\terminal64.exe', credentials_prefix: MT5_TWO, "
+        "magic: 101, deviation_points: 20}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigurationError, match=r"terminal_path|magic"):
+        load_accounts(path)
+
+
+def test_account_credentials_are_resolved_from_prefixed_environment(tmp_path: Path) -> None:
+    path = tmp_path / "accounts.yaml"
+    path.write_text(
+        "accounts:\n"
+        "  - {id: m1, name: M1, method: 1, role: MASTER, enabled: true, "
+        "terminal_path: 'C:\\\\MT5\\\\m1\\\\terminal64.exe', credentials_prefix: MT5_M1, "
+        "magic: 101, deviation_points: 20}\n",
+        encoding="utf-8",
+    )
+    account = load_accounts(path).accounts[0]
+    credentials = resolve_account_credentials(
+        account,
+        {"MT5_M1_LOGIN": "123", "MT5_M1_PASSWORD": "secret", "MT5_M1_SERVER": "Demo"},
+    )
+
+    assert account.role is AccountRole.MASTER
+    assert credentials.login == 123
+    assert credentials.server == "Demo"
+    assert credentials.password.get_secret_value() == "secret"
+
+
+def test_dynamic_account_credentials_load_from_dotenv_with_environment_override(
+    tmp_path: Path,
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "MT5_M1_LOGIN=123\n"
+        "MT5_M1_PASSWORD=from-file\n"
+        "MT5_M1_SERVER=File-Demo\n",
+        encoding="utf-8",
+    )
+
+    values = load_account_environment({"MT5_M1_PASSWORD": "from-environment"}, env_file)
+
+    assert values == {
+        "MT5_M1_LOGIN": "123",
+        "MT5_M1_PASSWORD": "from-environment",
+        "MT5_M1_SERVER": "File-Demo",
+    }
+
+
+def test_account_credential_error_does_not_echo_secret(tmp_path: Path) -> None:
+    path = tmp_path / "accounts.yaml"
+    path.write_text(
+        "accounts:\n"
+        "  - {id: m1, name: M1, method: 1, role: MASTER, enabled: true, "
+        "terminal_path: 'C:\\\\MT5\\\\m1\\\\terminal64.exe', credentials_prefix: MT5_M1, "
+        "magic: 101, deviation_points: 20}\n",
+        encoding="utf-8",
+    )
+    account = load_accounts(path).accounts[0]
+    with pytest.raises(ConfigurationError) as exc:
+        resolve_account_credentials(
+            account,
+            {"MT5_M1_LOGIN": "not-a-number", "MT5_M1_PASSWORD": "never-echo-me"},
+        )
+    assert "never-echo-me" not in str(exc.value)

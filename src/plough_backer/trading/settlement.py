@@ -34,6 +34,8 @@ class SettlementPolicy:
 @dataclass(frozen=True, slots=True)
 class Settlement:
     trade_id: int
+    account_id: str
+    risk_mode: int
     signal_id: str
     symbol: str
     direction: str
@@ -68,18 +70,26 @@ _CLOSED_STATE = {
 
 class Settler:
     def __init__(
-        self, *, sessions: sessionmaker[Session], gateway: BrokerGateway, policy: SettlementPolicy
+        self,
+        *,
+        sessions: sessionmaker[Session],
+        gateway: BrokerGateway,
+        policy: SettlementPolicy,
+        account_id: str = "default",
     ) -> None:
         self._sessions = sessions
         self._gateway = gateway
         self._policy = policy
+        self._account_id = account_id
 
     def reconcile(self) -> list[Settlement]:
         """One reconciliation pass. Safe to run repeatedly and after restarts (§30 steps 8-10)."""
         with self._sessions.begin() as s:
             candidates = s.execute(
                 select(Trade.id, Trade.mt5_position_id).where(
-                    Trade.settled_at.is_(None), Trade.mt5_position_id.is_not(None)
+                    Trade.account_id == self._account_id,
+                    Trade.settled_at.is_(None),
+                    Trade.mt5_position_id.is_not(None),
                 )
             ).all()
         if not candidates:
@@ -145,6 +155,7 @@ class Settler:
             repo.append_audit(
                 s,
                 AuditEventType.TRADE_SETTLED,
+                account_id=trade.account_id,
                 signal_id=trade.signal_id,
                 outcome=outcome,
                 net_profit=net,
@@ -153,6 +164,8 @@ class Settler:
             )
             return Settlement(
                 trade_id=trade.id,
+                account_id=trade.account_id,
+                risk_mode=trade.risk_mode,
                 signal_id=trade.signal_id,
                 symbol=trade.symbol_mt5,
                 direction=trade.direction,
