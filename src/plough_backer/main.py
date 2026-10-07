@@ -30,6 +30,7 @@ from plough_backer.persistence.database import (
     assert_migrations_current,
     make_engine,
     session_factory,
+    upgrade_migrations,
 )
 
 log = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ def bootstrap(settings: Settings) -> Engine:
     )
     account_secrets = [item.password.get_secret_value() for item in account_credentials]
     configure_logging(settings.log_level, [*settings.secret_values(), *account_secrets])
+    upgrade_migrations(settings.database_url)
     engine = make_engine(settings.database_url)
     assert_migrations_current(engine)
     log.info(

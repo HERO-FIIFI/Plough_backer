@@ -100,6 +100,24 @@ def test_bootstrap_succeeds_on_migrated_database(
         root.setLevel(saved_level)
 
 
+def test_bootstrap_automatically_migrates_fresh_database(
+    db_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(Path(__file__).parents[2])
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    try:
+        settings = load_settings(_env_file=None, **paper_settings(database_url=db_url))
+        engine = bootstrap(settings)
+        assert_migrations_current(engine)
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
+        engine.dispose()
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+
+
 def test_main_refuses_to_start_without_configuration(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

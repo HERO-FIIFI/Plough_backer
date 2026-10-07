@@ -8,7 +8,8 @@ Keeps Plough Backer running across hard process crashes (README §73).
 
 The task starts at logon (MT5 needs a desktop session, so not a service). Task Scheduler
 restarts this wrapper if it dies; the wrapper restarts Python whenever it exits.
-Exit code 2 (startup refused: config/migrations) stops the loop, since a restart can't fix it.
+Startup automatically applies pending Alembic migrations. Exit code 2 means configuration
+or an automatic migration failed and stops the loop, since a restart is unlikely to fix it.
 #>
 param([switch]$Install, [string]$Python = "python")
 

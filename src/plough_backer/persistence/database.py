@@ -9,6 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
@@ -116,3 +117,13 @@ def assert_migrations_current(engine: Engine) -> None:
             f"database at {sorted(current) or 'no revision'}, head is {sorted(heads)}; "
             "run `alembic upgrade head`"
         )
+
+
+def upgrade_migrations(database_url: str) -> None:
+    """Upgrade a fresh or existing database to head. Safe to call on every startup."""
+    cfg = alembic_config(database_url)
+    cfg.attributes["configure_logger"] = False
+    try:
+        command.upgrade(cfg, "head")
+    except Exception as exc:
+        raise MigrationStateError("automatic database migration failed") from exc

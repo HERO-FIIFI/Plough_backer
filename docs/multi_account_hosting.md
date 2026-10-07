@@ -1,5 +1,9 @@
 # Multi-account hosting
 
+On every startup, Plough Backer automatically runs the equivalent of `alembic upgrade head`
+before Telegram or MT5 connects. A fresh hosted installation therefore creates its database
+schema automatically; migration failures stop startup rather than running on a partial schema.
+
 Plough Backer can attach one or more directly managed MT5 master accounts to each risk
 method. A Telegram signal is parsed once and then executed independently for every enabled
 master account.
