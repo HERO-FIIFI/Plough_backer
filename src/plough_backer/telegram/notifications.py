@@ -111,6 +111,14 @@ def trade_executed(out: Outcome, source_name: str, mode: RiskMode) -> str:
     ]
     if out.volume_capped:
         lines.insert(14, "⚠️ Capped at broker maximum volume")
+    reset = out.extra.get("progression_reset")
+    if reset:
+        lines += [
+            "",
+            "Insufficient margin: progression reset from "
+            f"{lot(reset['old_theoretical_lot'])} to {lot(reset['new_theoretical_lot'])}.",
+            f"Order retried once at {out.executed_lot} lot and executed.",
+        ]
     return "\n".join(lines)
 
 
@@ -127,6 +135,14 @@ def equity_lock_blocked(out: Outcome) -> str:
     lock, s = out.lock, out.signal
     assert lock is not None
     assert s is not None
+    reset = out.extra.get("progression_reset")
+    progression = (
+        "Progression reset from "
+        f"{lot(reset['old_theoretical_lot'])} to {lot(reset['new_theoretical_lot'])}.\n"
+        "Retry blocked by Equity Lock."
+        if reset
+        else "Progression unchanged."
+    )
     return (
         "🔒 TRADE BLOCKED — EQUITY LOCK\n\n"
         f"Symbol: {s.symbol_mt5}\nProposed Lot: {out.executed_lot}\n\n"
@@ -134,7 +150,7 @@ def equity_lock_blocked(out: Outcome) -> str:
         f"Risk to SL:       {money(lock.risk_to_sl)}\n"
         f"Projected Equity: {money(lock.projected_equity)}\n"
         f"Protected Equity: {money(lock.protected_equity)}\n\n"
-        "Signal recorded.\nProgression unchanged."
+        f"Signal recorded.\n{progression}"
     )
 
 
@@ -167,10 +183,18 @@ def for_outcome(out: Outcome, source_name: str, mode: RiskMode) -> str | None:
     if out.state in _SKIPPED:
         detail = out.extra.get("detail", "")
         signal = f"\n\nSignal: {out.signal_id}" if out.signal_id else ""
+        reset = out.extra.get("progression_reset")
+        progression = (
+            "\nProgression reset from "
+            f"{lot(reset['old_theoretical_lot'])} to {lot(reset['new_theoretical_lot'])}; "
+            "the one-time retry was also rejected."
+            if reset
+            else "\nProgression unchanged."
+        )
         return (
             f"{_SKIPPED[out.state]}{signal}"
             + (f"\n{detail}" if detail else "")
-            + ("\nProgression unchanged.")
+            + progression
         )
     # Duplicates and paper sizing are journaled; no push (avoid spam on catch-up replays).
     return None

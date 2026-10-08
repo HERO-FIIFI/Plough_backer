@@ -1,6 +1,7 @@
 """Phase 6: every lifecycle exit, idempotency (§64), crash safety (INV-15), INV-02..05."""
 
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -204,15 +205,151 @@ def test_mt5_down_skips_and_never_replays(engine: Engine, gw: FakeGateway) -> No
     assert gw.orders == []
 
 
-def test_broker_rejection_is_recorded_not_retried(engine: Engine, gw: FakeGateway) -> None:
+def test_no_money_resets_progression_and_retries_once_at_base_lot(
+    engine: Engine, gw: FakeGateway, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Catches leaving the unaffordable progression in place or retrying the same large lot."""
+    progressed = ProgressionState(
+        mode=RiskMode.ANTI_MARTINGALE,
+        base_lot=D("0.01"),
+        theoretical_lot=D("0.16"),
+        wins=4,
+    )
+    unrelated_key = "PER_SOURCE:other:XAUUSD"
+    with session_factory(engine).begin() as s:
+        repo.create_progression(s, KEY, progressed)
+        repo.create_progression(s, unrelated_key, progressed)
+    gw.failures = [BrokerRejected(10019, "No money")]
+
+    with caplog.at_level("WARNING"):
+        out = send(orchestrator(engine, gw))
+
+    assert out.state is SignalState.OPEN
+    assert [order.volume for order in gw.orders] == [D("0.16"), D("0.01")]
+    assert out.extra["progression_reset"] == {
+        "reason": "INSUFFICIENT_MARGIN",
+        "old_theoretical_lot": D("0.16"),
+        "new_theoretical_lot": D("0.01"),
+        "retried": True,
+    }
+    (trade,) = trades(engine)
+    assert (trade.theoretical_lot, trade.executed_lot, trade.execution_retcode) == (
+        D("0.01"),
+        D("0.01"),
+        10009,
+    )
+    assert progression(engine) == (
+        ProgressionState.initial(RiskMode.ANTI_MARTINGALE, D("0.01")),
+        2,
+    )
+    with session_factory(engine).begin() as s:
+        unrelated = repo.load_progression(s, unrelated_key)
+        events = list(s.scalars(select(AuditEvent).order_by(AuditEvent.id)).all())
+    assert unrelated == (progressed, 1)
+    rejected = next(e for e in events if e.event_type == AuditEventType.TRADE_REJECTED)
+    assert rejected.payload == {
+        "signal_id": "PB-000001",
+        "retcode": 10019,
+        "broker_message": "No money",
+        "rejected_lot": "0.16",
+        "balance": "800",
+        "equity": "800",
+        "free_margin": "800",
+    }
+    reset = next(e for e in events if e.event_type == AuditEventType.PROGRESSION_RESET)
+    assert reset.payload["reason"] == "INSUFFICIENT_MARGIN"
+    assert reset.payload["old_theoretical_lot"] == "0.16"
+    assert reset.payload["new_theoretical_lot"] == "0.01"
+    record = next(r for r in caplog.records if r.message == "insufficient_margin_progression_reset")
+    assert (record.account_id, record.retcode, record.rejected_lot) == ("default", 10019, D("0.16"))
+
+
+def test_no_money_retry_stops_after_one_attempt(engine: Engine, gw: FakeGateway) -> None:
+    with session_factory(engine).begin() as s:
+        repo.create_progression(
+            s,
+            KEY,
+            ProgressionState(
+                mode=RiskMode.ANTI_MARTINGALE,
+                base_lot=D("0.01"),
+                theoretical_lot=D("0.16"),
+                wins=4,
+            ),
+        )
     gw.fail_with = BrokerRejected(10019, "No money")
+
     out = send(orchestrator(engine, gw))
+
     assert out.state is SignalState.BROKER_REJECTED
-    (t,) = trades(engine)
-    assert (t.execution_retcode, t.result) == (10019, None)
-    gw.fail_with = None
-    assert send(orchestrator(engine, gw)).state is SignalState.REJECTED_DUPLICATE
-    assert progression(engine) == (ProgressionState.initial(RiskMode.ANTI_MARTINGALE, D("0.01")), 1)
+    assert [order.volume for order in gw.orders] == [D("0.16"), D("0.01")]
+    assert out.extra["progression_reset"]["retried"] is True
+    assert progression(engine) == (
+        ProgressionState.initial(RiskMode.ANTI_MARTINGALE, D("0.01")),
+        2,
+    )
+
+
+def test_no_money_reset_rechecks_equity_lock_before_retry(
+    engine: Engine, gw: FakeGateway
+) -> None:
+    with session_factory(engine).begin() as s:
+        repo.create_progression(
+            s,
+            KEY,
+            ProgressionState(
+                mode=RiskMode.ANTI_MARTINGALE,
+                base_lot=D("0.01"),
+                theoretical_lot=D("0.16"),
+                wins=4,
+            ),
+        )
+        controls.set_equity_lock(s, enabled=True, value=D("20"), actor="42")
+    gw.failures = [BrokerRejected(10019, "No money")]
+    gw.account_snapshots = [
+        gw.account,
+        replace(gw.account, balance=D("25"), equity=D("25"), free_margin=D("25")),
+    ]
+
+    out = send(orchestrator(engine, gw))
+
+    assert out.state is SignalState.BLOCKED_EQUITY_LOCK
+    assert [order.volume for order in gw.orders] == [D("0.16")]
+    assert out.extra["progression_reset"]["retried"] is False
+    assert progression(engine) == (
+        ProgressionState.initial(RiskMode.ANTI_MARTINGALE, D("0.01")),
+        2,
+    )
+
+
+def test_other_broker_rejection_is_recorded_without_reset_or_retry(
+    engine: Engine, gw: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    progressed = ProgressionState(
+        mode=RiskMode.ANTI_MARTINGALE,
+        base_lot=D("0.01"),
+        theoretical_lot=D("0.16"),
+        wins=4,
+    )
+    with session_factory(engine).begin() as s:
+        repo.create_progression(s, KEY, progressed)
+    gw.fail_with = BrokerRejected(10018, "Market closed")
+    snapshots = 0
+
+    def account_snapshot() -> Any:
+        nonlocal snapshots
+        snapshots += 1
+        if snapshots > 1:
+            raise RuntimeError("broker unavailable after rejection")
+        return gw.account
+
+    monkeypatch.setattr(gw, "account_snapshot", account_snapshot)
+
+    out = send(orchestrator(engine, gw))
+
+    assert out.state is SignalState.BROKER_REJECTED
+    assert [order.volume for order in gw.orders] == [D("0.16")]
+    assert "progression_reset" not in out.extra
+    assert progression(engine) == (progressed, 1)
 
 
 @pytest.mark.parametrize("policy", [VolumeMaxPolicy.REJECT, VolumeMaxPolicy.CAP])

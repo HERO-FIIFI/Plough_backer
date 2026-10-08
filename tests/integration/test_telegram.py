@@ -17,6 +17,7 @@ from plough_backer.enums import (
     SignalState,
     TradingStatus,
 )
+from plough_backer.exceptions import BrokerRejected
 from plough_backer.persistence.database import PROJECT_ROOT, session_factory
 from plough_backer.persistence.models import AuditEvent, Signal
 from plough_backer.telegram import notifications as n
@@ -248,6 +249,73 @@ def test_trade_executed_notification(engine: Engine, gw: FakeGateway) -> None:
         "Signal: PB-000001",
     ):
         assert part in text
+
+
+def test_insufficient_margin_retry_notification_explains_reset(
+    engine: Engine, gw: FakeGateway
+) -> None:
+    from plough_backer.persistence import repositories as repo
+    from plough_backer.risk.progression import ProgressionState
+    from tests.integration.test_orchestrator import KEY
+
+    with session_factory(engine).begin() as s:
+        repo.create_progression(
+            s,
+            KEY,
+            ProgressionState(
+                mode=RiskMode.ANTI_MARTINGALE,
+                base_lot=Decimal("0.01"),
+                theoretical_lot=Decimal("0.16"),
+                wins=4,
+            ),
+        )
+    gw.failures = [BrokerRejected(10019, "No money")]
+
+    out = send(orchestrator(engine, gw))
+    text = n.for_outcome(out, "Gold Signals", RiskMode.ANTI_MARTINGALE)
+
+    assert text is not None
+    assert "Insufficient margin: progression reset from 0.1600 to 0.0100." in text
+    assert "Order retried once at 0.01 lot and executed." in text
+
+
+def test_equity_lock_notification_explains_margin_reset_without_retry(
+    engine: Engine, gw: FakeGateway
+) -> None:
+    from plough_backer.persistence import repositories as repo
+    from plough_backer.risk.progression import ProgressionState
+    from tests.integration.test_orchestrator import KEY
+
+    with session_factory(engine).begin() as s:
+        repo.create_progression(
+            s,
+            KEY,
+            ProgressionState(
+                mode=RiskMode.ANTI_MARTINGALE,
+                base_lot=Decimal("0.01"),
+                theoretical_lot=Decimal("0.16"),
+                wins=4,
+            ),
+        )
+        controls.set_equity_lock(s, enabled=True, value=Decimal("20"), actor="42")
+    gw.failures = [BrokerRejected(10019, "No money")]
+    gw.account_snapshots = [
+        gw.account,
+        replace(
+            gw.account,
+            balance=Decimal("25"),
+            equity=Decimal("25"),
+            free_margin=Decimal("25"),
+        ),
+    ]
+
+    out = send(orchestrator(engine, gw))
+    text = n.for_outcome(out, "Gold Signals", RiskMode.ANTI_MARTINGALE)
+
+    assert text is not None
+    assert "Progression reset from 0.1600 to 0.0100." in text
+    assert "Retry blocked by Equity Lock." in text
+    assert "Progression unchanged." not in text
 
 
 def test_invalid_signal_notification_matches_readme(engine: Engine, gw: FakeGateway) -> None:

@@ -15,7 +15,7 @@ reconciliation (Phase 8) resolves what MT5 actually did.
 import logging
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -56,9 +56,10 @@ from plough_backer.risk.progression import ProgressionState, reset_at_broker_lim
 from plough_backer.signals.fingerprint import fingerprint
 from plough_backer.signals.models import NormalizedSignal
 from plough_backer.signals.parser import get_parser
-from plough_backer.trading.gateway import BrokerGateway, OrderRequest, OrderResult
+from plough_backer.trading.gateway import AccountSnapshot, BrokerGateway, OrderRequest, OrderResult
 
 log = logging.getLogger(__name__)
+MT5_RETCODE_NO_MONEY = 10019
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -614,27 +615,16 @@ class Orchestrator:
         try:
             result = self._gateway.submit_order(request)
         except BrokerError as exc:
-            state = _broker_state(exc)
-            retcode = exc.retcode if isinstance(exc, BrokerRejected) else None
-            with self._sessions.begin() as s:
-                trade = s.get(Trade, trade_id)
-                assert trade is not None
-                trade.execution_retcode, trade.execution_message = retcode, str(exc)
-                trade.broker_response_at = self._now()
-                signal = s.get(Signal, trade.signal_pk)
-                assert signal is not None
-                repo.append_audit(
-                    s,
-                    AuditEventType.TRADE_REJECTED,
-                    account_id=self._account_id,
-                    signal_id=trade.signal_id,
-                    error=str(exc),
-                )
-                if transition_signal:
-                    return self._end(s, signal, out, state, type(exc).__name__, str(exc))
-                out.state, out.reason = state, type(exc).__name__
-                out.extra["detail"] = str(exc)
-                return out
+            retry = self._prepare_no_money_retry(out, request, trade_id, exc)
+            if out.state is SignalState.BLOCKED_EQUITY_LOCK:
+                return self._finish_reset_block(out, trade_id, exc, transition_signal)
+            if retry is None:
+                return self._finish_rejection(out, trade_id, exc, transition_signal)
+            request = retry
+            try:
+                result = self._gateway.submit_order(request)
+            except BrokerError as retry_exc:
+                return self._finish_rejection(out, trade_id, retry_exc, transition_signal)
 
         out.result = result
         with self._sessions.begin() as s:
@@ -711,6 +701,188 @@ class Orchestrator:
         if detail:
             out.extra["detail"] = detail
         return out
+
+    def _prepare_no_money_retry(
+        self,
+        out: Outcome,
+        request: OrderRequest,
+        trade_id: int,
+        exc: BrokerError,
+    ) -> OrderRequest | None:
+        """Persist a scope reset, then allow one smaller retry for MT5 NO_MONEY only."""
+        if not isinstance(exc, BrokerRejected) or exc.retcode != MT5_RETCODE_NO_MONEY:
+            return None
+        assert self._gateway is not None
+        account = self._gateway.account_snapshot()
+        with self._sessions.begin() as s:
+            trade = s.get(Trade, trade_id)
+            assert trade is not None
+            loaded = repo.load_progression(s, trade.progression_scope_key)
+            if loaded is None or loaded[0].theoretical_lot <= trade.volume_min:
+                return None
+            previous, version = loaded
+            reset = ProgressionState.initial(previous.mode, trade.volume_min)
+            assert out.signal is not None
+            risk = assess_risk(
+                self._gateway,
+                symbol=trade.symbol_mt5,
+                direction=Direction(trade.direction),
+                executed_lot=trade.volume_min,
+                entry_price=self._risk_entry(self._gateway, out.signal),
+                stop_loss=trade.stop_loss,
+                take_profit=trade.selected_tp,
+                equity=account.equity,
+            )
+            lock_enabled, lock_value = controls.equity_lock(s)
+            lock = check_equity_lock(
+                enabled=lock_enabled,
+                protected_equity=lock_value,
+                current_equity=account.equity,
+                risk_to_sl=risk.risk_to_sl,
+            )
+            self._journal_rejection(s, trade, exc, request.volume, account)
+            repo.save_progression(
+                s, trade.progression_scope_key, reset, expected_version=version
+            )
+            repo.append_audit(
+                s,
+                AuditEventType.PROGRESSION_RESET,
+                account_id=self._account_id,
+                scope_key=trade.progression_scope_key,
+                symbol=trade.symbol_mt5,
+                signal_id=trade.signal_id,
+                reason="INSUFFICIENT_MARGIN",
+                retcode=exc.retcode,
+                old_theoretical_lot=previous.theoretical_lot,
+                new_theoretical_lot=reset.theoretical_lot,
+            )
+            trade.theoretical_lot = reset.theoretical_lot
+            trade.executed_lot = trade.volume_min
+            trade.estimated_risk = risk.risk_to_sl
+            trade.estimated_reward = risk.reward_to_tp
+            trade.estimated_rr = risk.reward_risk_ratio
+            trade.equity_risk_percent = risk.equity_risk_percent
+            trade.balance_before = account.balance
+            trade.equity_before = account.equity
+            trade.margin_before = account.margin
+            trade.free_margin_before = account.free_margin
+            out.theoretical_lot = reset.theoretical_lot
+            out.executed_lot = trade.volume_min
+            out.risk = risk
+            out.lock = lock
+            out.extra["progression_reset"] = {
+                "reason": "INSUFFICIENT_MARGIN",
+                "old_theoretical_lot": previous.theoretical_lot,
+                "new_theoretical_lot": reset.theoretical_lot,
+                "retried": lock.allowed,
+            }
+            log.warning(
+                "insufficient_margin_progression_reset",
+                extra={
+                    "account_id": self._account_id,
+                    "signal_id": trade.signal_id,
+                    "scope_key": trade.progression_scope_key,
+                    "retcode": exc.retcode,
+                    "broker_message": exc.message,
+                    "rejected_lot": request.volume,
+                    "new_lot": reset.theoretical_lot,
+                    "balance": account.balance,
+                    "equity": account.equity,
+                    "free_margin": account.free_margin,
+                },
+            )
+            if not lock.allowed:
+                out.state = SignalState.BLOCKED_EQUITY_LOCK
+                return None
+        return replace(request, volume=out.executed_lot)
+
+    def _finish_reset_block(
+        self,
+        out: Outcome,
+        trade_id: int,
+        exc: BrokerError,
+        transition_signal: bool,
+    ) -> Outcome:
+        """Record the original rejection without retrying past a freshly checked lock."""
+        retcode = exc.retcode if isinstance(exc, BrokerRejected) else None
+        with self._sessions.begin() as s:
+            trade = s.get(Trade, trade_id)
+            assert trade is not None
+            trade.execution_retcode, trade.execution_message = retcode, str(exc)
+            trade.broker_response_at = self._now()
+            signal = s.get(Signal, trade.signal_pk)
+            assert signal is not None
+            reason = "EQUITY_LOCK_AFTER_MARGIN_RESET"
+            if transition_signal:
+                return self._end(s, signal, out, SignalState.BLOCKED_EQUITY_LOCK, reason)
+            out.state, out.reason = SignalState.BLOCKED_EQUITY_LOCK, reason
+            return out
+
+    def _finish_rejection(
+        self,
+        out: Outcome,
+        trade_id: int,
+        exc: BrokerError,
+        transition_signal: bool,
+    ) -> Outcome:
+        state = _broker_state(exc)
+        retcode = exc.retcode if isinstance(exc, BrokerRejected) else None
+        with self._sessions.begin() as s:
+            trade = s.get(Trade, trade_id)
+            assert trade is not None
+            trade.execution_retcode, trade.execution_message = retcode, str(exc)
+            trade.broker_response_at = self._now()
+            signal = s.get(Signal, trade.signal_pk)
+            assert signal is not None
+            account = AccountSnapshot(
+                balance=trade.balance_before,
+                equity=trade.equity_before,
+                margin=trade.margin_before,
+                free_margin=trade.free_margin_before,
+                currency="",
+            )
+            self._journal_rejection(s, trade, exc, trade.executed_lot, account)
+            if transition_signal:
+                return self._end(s, signal, out, state, type(exc).__name__, str(exc))
+            out.state, out.reason = state, type(exc).__name__
+            out.extra["detail"] = str(exc)
+            return out
+
+    def _journal_rejection(
+        self,
+        s: Session,
+        trade: Trade,
+        exc: BrokerError,
+        rejected_lot: Decimal,
+        account: Any,
+    ) -> None:
+        retcode = exc.retcode if isinstance(exc, BrokerRejected) else None
+        message = exc.message if isinstance(exc, BrokerRejected) else str(exc)
+        repo.append_audit(
+            s,
+            AuditEventType.TRADE_REJECTED,
+            account_id=self._account_id,
+            signal_id=trade.signal_id,
+            retcode=retcode,
+            broker_message=message,
+            rejected_lot=rejected_lot,
+            balance=account.balance,
+            equity=account.equity,
+            free_margin=account.free_margin,
+        )
+        log.warning(
+            "trade_rejected",
+            extra={
+                "account_id": self._account_id,
+                "signal_id": trade.signal_id,
+                "retcode": retcode,
+                "broker_message": message,
+                "rejected_lot": rejected_lot,
+                "balance": account.balance,
+                "equity": account.equity,
+                "free_margin": account.free_margin,
+            },
+        )
 
 
 class SignalIngestor:

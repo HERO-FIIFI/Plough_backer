@@ -956,7 +956,16 @@ Execution may legitimately fail because of:
 
 These failures MUST NOT be classified as trading losses.
 
-They MUST NOT advance progression.
+They MUST NOT apply a WIN/LOSS rule or advance progression.
+
+One audited safety exception applies to MT5 retcode `10019` (`NO_MONEY`). If the rejected
+lot is above the symbol's current `volume_min`, reset only that account's exact progression
+scope to `volume_min`, recalculate risk and Equity Lock from a fresh account snapshot, and
+retry the same signal once at the minimum lot. Never retry more than once. If the fresh
+Equity Lock check blocks the minimum lot, do not retry. Other broker rejections leave
+progression unchanged. The trade journal, audit trail, structured log, and Telegram message
+must preserve the rejection reason, rejected lot, account balance/equity/free margin, reset,
+and retry result.
 
 ---
 
@@ -2714,7 +2723,8 @@ An Equity-Lock-blocked trade does not alter progression.
 
 ### INV-04
 
-A broker-rejected trade does not alter progression.
+A broker-rejected trade does not apply a WIN/LOSS rule. The only state change allowed is the
+audited `NO_MONEY` safety reset in §21 for that account's exact progression scope.
 
 ### INV-05
 

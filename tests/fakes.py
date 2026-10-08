@@ -54,10 +54,12 @@ class FakeGateway:
             balance=D(800), equity=D(800), margin=D(0), free_margin=D(800), currency="USD"
         )
     )
+    account_snapshots: list[AccountSnapshot] = field(default_factory=list)
     connected: bool = True
     bid: Decimal = field(default_factory=lambda: D("4500.10"))
     ask: Decimal = field(default_factory=lambda: D("4500.30"))
     fail_with: Exception | None = None  # raised by submit_order
+    failures: list[Exception] = field(default_factory=list)  # one failure per attempted order
     orders: list[OrderRequest] = field(default_factory=list)
     _next_ticket: int = 1000
 
@@ -66,6 +68,8 @@ class FakeGateway:
 
     def submit_order(self, request: OrderRequest) -> OrderResult:
         self.orders.append(request)
+        if self.failures:
+            raise self.failures.pop(0)
         if self.fail_with is not None:
             raise self.fail_with
         self._next_ticket += 1
@@ -101,6 +105,8 @@ class FakeGateway:
         return self.connected
 
     def account_snapshot(self) -> AccountSnapshot:
+        if self.account_snapshots:
+            return self.account_snapshots.pop(0)
         return self.account
 
     def symbol_specification(self, symbol: str) -> SymbolSpecification:
